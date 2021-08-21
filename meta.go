@@ -3,7 +3,9 @@ package bittorrent
 import (
 	"bytes"
 	"crypto/sha1"
+	"errors"
 	"io"
+	"net"
 
 	"github.com/zeebo/bencode"
 )
@@ -56,13 +58,39 @@ type TrackerRequest struct {
 }
 
 type TrackerResponse struct {
-	FailureReason string `bencode:"failure reason"`
-	Interval      int    `bencode:"interval"`
-	TrackerID     string `bencode:"tracker id"`
-	Complete      int    `bencode:"complete"`
-	Incomplete    int    `bencode:"incomplete"`
-	// XXX support BEP 23
-	Peers []PeerInfo `bencode:"peers"`
+	FailureReason string    `bencode:"failure reason"`
+	Interval      int       `bencode:"interval"`
+	TrackerID     string    `bencode:"tracker id"`
+	Complete      int       `bencode:"complete"`
+	Incomplete    int       `bencode:"incomplete"`
+	Peers         PeerInfos `bencode:"peers"`
+}
+
+type PeerInfos []PeerInfo
+
+func (pi *PeerInfos) UnmarshalBencode(b []byte) error {
+	if b[0] == 'l' {
+		// list of dicts
+		return bencode.DecodeBytes(b, (*[]PeerInfo)(pi))
+	} else if b[0] >= '0' || b[0] <= '9' {
+		// compact encoding
+		var s string
+		if err := bencode.DecodeBytes(b, &s); err != nil {
+			return err
+		}
+		if len(s)%6 != 0 {
+			return errors.New("malformed compact peer list encoding")
+		}
+		for len(s) > 0 {
+			ip := net.IPv4(s[0], s[1], s[2], s[3])
+			port := int(s[4])<<8 | int(s[5])
+			*pi = append(*pi, PeerInfo{IP: ip.String(), Port: port})
+			s = s[6:]
+		}
+	} else {
+		return errors.New("unsupported peer list encoding")
+	}
+	return nil
 }
 
 type PeerInfo struct {
