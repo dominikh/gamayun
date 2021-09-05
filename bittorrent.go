@@ -30,6 +30,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -67,9 +68,6 @@ type Session struct {
 	incomingConnections chan *protocol.Connection
 	closedConnections   chan *Peer
 
-	// The context passed to Session.Run, which gets used by Session.AddTorrent
-	ctx context.Context
-
 	// XXX check alignment on ARM
 	statistics Statistics
 
@@ -77,6 +75,8 @@ type Session struct {
 	peersWg    sync.WaitGroup
 
 	mu       sync.RWMutex
+	closing  chan struct{}
+	listener net.Listener
 	Torrents map[protocol.InfoHash]*Torrent
 }
 
@@ -120,8 +120,10 @@ func NewSession() *Session {
 		Torrents: map[protocol.InfoHash]*Torrent{},
 		Peers:    map[*Peer]struct{}{},
 		// XXX optimize all these buffer sizes
+		// incomingCOnnections has to be unbuffered so that every incoming connection either gets handled or closed.
 		incomingConnections: make(chan *protocol.Connection),
 		closedConnections:   make(chan *Peer),
+		closing:             make(chan struct{}),
 	}
 }
 
@@ -157,9 +159,9 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 }
 
 func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
-	if _, ok := channel.TryRecv(sess.ctx.Done()); ok {
+	if _, ok := channel.TryRecv(sess.closing); ok {
 		// Don't add new torrent to an already stopped client
-		return sess.ctx.Err()
+		return errClosing
 	}
 
 	// XXX check the torrent hasn't already been added
@@ -191,10 +193,11 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
 	sess.Torrents[torr.Hash] = torr
 	sess.unlock()
 
+	// XXX there is a race here. Shutdown's wg.Wait can finish before we increment the wg
+	sess.torrentsWg.Add(1)
 	go func() {
-		sess.torrentsWg.Add(1)
 		defer sess.torrentsWg.Done()
-		sess.runTorrent(sess.ctx, torr)
+		sess.runTorrent(torr)
 	}()
 	return nil
 }
@@ -251,16 +254,23 @@ func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) 
 	return &tresp, nil
 }
 
-func (sess *Session) listen(ctx context.Context) error {
+var errClosing = errors.New("client is shutting down")
+
+func (sess *Session) listen() error {
+	defer log.Println("listener goroutine has quit")
+
 	l, err := net.Listen("tcp", net.JoinHostPort(sess.Settings.ListenAddress, sess.Settings.ListenPort))
 	if err != nil {
 		return err
 	}
 
-	go func() {
-		<-ctx.Done()
+	sess.mu.Lock()
+	if _, ok := channel.TryRecv(sess.closing); ok {
 		l.Close()
-	}()
+		return errClosing
+	}
+	sess.listener = l
+	sess.mu.Unlock()
 
 	for {
 		conn, err := l.Accept()
@@ -270,9 +280,9 @@ func (sess *Session) listen(ctx context.Context) error {
 		pconn := protocol.NewConnection(conn)
 		select {
 		case sess.incomingConnections <- pconn:
-		case <-ctx.Done():
+		case <-sess.closing:
 			pconn.Close()
-			return ctx.Err()
+			return nil
 		}
 	}
 }
@@ -334,7 +344,25 @@ type VerifiedTorrent struct {
 	Have    Bitset
 }
 
-func (peer *Peer) blockReader(ctx context.Context) error {
+func (peer *Peer) write(msg Message) error {
+	select {
+	case peer.writes <- msg:
+		return nil
+	case <-peer.Session.closing:
+		return errClosing
+	}
+}
+
+func (peer *Peer) controlWrite(msg Message) error {
+	select {
+	case peer.controlWrites <- msg:
+		return nil
+	case <-peer.Session.closing:
+		return errClosing
+	}
+}
+
+func (peer *Peer) blockReader() error {
 	for {
 		select {
 		case req := <-peer.incomingRequests:
@@ -362,8 +390,7 @@ func (peer *Peer) blockReader(ctx context.Context) error {
 
 				// XXX track upload stat
 
-				select {
-				case peer.writes <- Message{
+				return peer.write(Message{
 					Message: protocol.Message{
 						Type:   protocol.MessageTypePiece,
 						Index:  req.Index,
@@ -371,22 +398,18 @@ func (peer *Peer) blockReader(ctx context.Context) error {
 						Length: req.Length,
 						Data:   buf,
 					},
-				}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-				return nil
+				})
 			}()
 			if err != nil {
 				return err
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-peer.Session.closing:
+			return errClosing
 		}
 	}
 }
 
-func (peer *Peer) readPeer(ctx context.Context) error {
+func (peer *Peer) readPeer() error {
 	// XXX add handshake and peer id to DownloadedTotal stat
 
 	hash, err := peer.Conn.ReadHandshake()
@@ -395,8 +418,8 @@ func (peer *Peer) readPeer(ctx context.Context) error {
 	}
 	select {
 	case peer.handshake <- hash:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-peer.Session.closing:
+		return errClosing
 	}
 
 	id, err := peer.Conn.ReadPeerID()
@@ -405,12 +428,12 @@ func (peer *Peer) readPeer(ctx context.Context) error {
 	}
 	select {
 	case peer.peerID <- id:
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-peer.Session.closing:
+		return errClosing
 	}
 
 	for {
-		msg, err := peer.Conn.ReadMessage(ctx)
+		msg, err := peer.Conn.ReadMessage()
 		if err != nil {
 			return err
 		}
@@ -419,13 +442,13 @@ func (peer *Peer) readPeer(ctx context.Context) error {
 		case peer.msgs <- Message{
 			Message: msg,
 		}:
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-peer.Session.closing:
+			return errClosing
 		}
 	}
 }
 
-func (peer *Peer) writePeer(ctx context.Context) error {
+func (peer *Peer) writePeer() error {
 	writeMsg := func(msg Message) error {
 		atomic.AddUint64(&peer.Session.statistics.UploadedTotal, uint64(msg.Size()))
 		return peer.Conn.WriteMessage(msg.Message)
@@ -449,8 +472,8 @@ func (peer *Peer) writePeer(ctx context.Context) error {
 			if err := writeMsg(msg); err != nil {
 				return err
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-peer.Session.closing:
+			return errClosing
 		}
 	}
 }
@@ -471,15 +494,14 @@ func (err WriteError) Unwrap() error {
 	return err.error
 }
 
-func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (sess *Session) RunPeer(peer *Peer) error {
+	defer peer.Conn.Close()
 
 	errs := make(chan error, 1)
 	// OPT multiple reader goroutines?
-	go func() { channel.TrySend(errs, peer.blockReader(ctx)) }()
-	go func() { channel.TrySend(errs, peer.readPeer(ctx)) }()
-	go func() { channel.TrySend(errs, peer.writePeer(ctx)) }()
+	go func() { channel.TrySend(errs, peer.blockReader()) }()
+	go func() { channel.TrySend(errs, peer.readPeer()) }()
+	go func() { channel.TrySend(errs, peer.writePeer()) }()
 
 	t := time.NewTicker(time.Second)
 	for {
@@ -493,18 +515,24 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 
 			if !peer.peerInterested && !peer.amChoking {
 				peer.amChoking = true
-				peer.controlWrites <- Message{
+				err := peer.controlWrite(Message{
 					Message: protocol.Message{
 						Type: protocol.MessageTypeChoke,
 					},
+				})
+				if err != nil {
+					return err
 				}
 			} else if peer.peerInterested && peer.amChoking {
 				// XXX limit number of unchoked peers
 				peer.amChoking = false
-				peer.controlWrites <- Message{
+				err := peer.controlWrite(Message{
 					Message: protocol.Message{
 						Type: protocol.MessageTypeUnchoke,
 					},
+				})
+				if err != nil {
+					return err
 				}
 			}
 
@@ -542,7 +570,11 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 			// Note that we send to torr.newPeers after we got the
 			// peer ID, not after the first half of the handshake, to
 			// avoid a race on peer.PeerID.
-			peer.Torrent.newPeers <- peer
+			select {
+			case peer.Torrent.newPeers <- peer:
+			case <-sess.closing:
+				return errClosing
+			}
 
 			// We've received their handshake and peer ID and have
 			// sent ours, now tell the peer which pieces we have
@@ -553,26 +585,35 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 			torr.unlock()
 			peer.lastHaveSent = have
 			if have.count == 0 {
-				peer.writes <- Message{
+				err := peer.write(Message{
 					Message: protocol.Message{
 						Type: protocol.MessageTypeHaveNone,
 					},
+				})
+				if err != nil {
+					return err
 				}
 			} else if have.count == torr.NumPieces() {
-				peer.writes <- Message{
+				err := peer.write(Message{
 					Message: protocol.Message{
 						Type: protocol.MessageTypeHaveAll,
 					},
+				})
+				if err != nil {
+					return err
 				}
 			} else if have.count*haveMessageSize < torr.NumPieces()/8 || true {
 				// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
 				for i := 0; i < torr.NumPieces(); i++ {
 					if have.bits.Bit(i) != 0 {
-						peer.writes <- Message{
+						err := peer.write(Message{
 							Message: protocol.Message{
 								Type:  protocol.MessageTypeHave,
 								Index: uint32(i),
 							},
+						})
+						if err != nil {
+							return err
 						}
 					}
 				}
@@ -619,13 +660,16 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 					// XXX verify that index, begin and length are in bounds
 					// XXX reject if we don't have the piece
 					if peer.amChoking {
-						peer.controlWrites <- Message{
+						err := peer.controlWrite(Message{
 							Message: protocol.Message{
 								Type:   protocol.MessageTypeRejectRequest,
 								Index:  msg.Index,
 								Begin:  msg.Begin,
 								Length: msg.Length,
 							},
+						})
+						if err != nil {
+							return err
 						}
 					} else {
 						req := Request{
@@ -634,13 +678,16 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 							Length: msg.Length,
 						}
 						if !channel.TrySend(peer.incomingRequests, req) {
-							peer.controlWrites <- Message{
+							err := peer.controlWrite(Message{
 								Message: protocol.Message{
 									Type:   protocol.MessageTypeRejectRequest,
 									Index:  msg.Index,
 									Begin:  msg.Begin,
 									Length: msg.Length,
 								},
+							})
+							if err != nil {
+								return err
 							}
 						}
 					}
@@ -672,13 +719,14 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 					panic(fmt.Sprintf("unhandled message %s", msg))
 				}
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-peer.Session.closing:
+			peer.Conn.Close()
+			return errClosing
 		}
 	}
 }
 
-func (sess *Session) runTorrent(ctx context.Context, torr *Torrent) error {
+func (sess *Session) runTorrent(torr *Torrent) error {
 	torr.State = TorrentStateVerifying
 	torr.NextState = TorrentStateStopped
 
@@ -730,8 +778,8 @@ func (sess *Session) runTorrent(ctx context.Context, torr *Torrent) error {
 	for {
 		select {
 		case <-announcer.C:
-			// TODO(dh): we probably shouldn't block trying to send the announce
-			tresp, err := sess.announce(ctx, torr, "")
+			// TODO(dh): we probably shouldn't block trying to send the announce. especially not if we're shutting down
+			tresp, err := sess.announce(context.TODO(), torr, "")
 			if err != nil {
 				// TODO(dh): try to announce again soon, don't wait for the next planned announc
 				log.Printf("failed announcing %s to %s: %s", torr.Hash, torr.Metainfo.Announce, err)
@@ -745,22 +793,38 @@ func (sess *Session) runTorrent(ctx context.Context, torr *Torrent) error {
 			log.Printf("new peer %s for torrent %s", peer, torr)
 			// XXX
 			_ = peer
-		case <-ctx.Done():
-			// XXX send event=stopped to tracker
-			return ctx.Err()
+		case <-sess.closing:
+			// XXX respect Shutdown timing out, handle announce failing and retry
+			sess.announce(context.TODO(), torr, "stopped")
+			return errClosing
 		}
 	}
 }
 
+func (sess *Session) Shutdown(ctx context.Context) error {
+	log.Println("Shutting down")
+	defer log.Println("Shut down")
+
+	sess.mu.Lock()
+	close(sess.closing)
+	if sess.listener != nil {
+		sess.listener.Close()
+	}
+	sess.mu.Unlock()
+
+	// XXX forcefully close all peer connections
+	// XXX allow ctx to cancel waiting
+	sess.torrentsWg.Wait()
+	log.Println("All torrents done")
+	sess.peersWg.Wait()
+	log.Println("All peers done")
+	return nil
+}
+
 // XXX instead of giving Run a context, implement net/http.Server's model and have a Stop method instead. That way, the user can provide a separate timeout for the Stop operation.
-func (sess *Session) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sess.ctx = ctx
-
+func (sess *Session) Run() error {
 	errs := make(chan error, 1)
-	go func() { errs <- sess.listen(ctx) }()
+	go func() { errs <- sess.listen() }()
 
 	for {
 		select {
@@ -788,33 +852,27 @@ func (sess *Session) Run(ctx context.Context) error {
 			}
 			sess.Peers[peer] = struct{}{}
 
+			sess.peersWg.Add(1)
 			go func() {
-				sess.peersWg.Add(1)
 				defer sess.peersWg.Done()
-				err := sess.RunPeer(ctx, peer)
+				err := sess.RunPeer(peer)
 				log.Printf("peer failed: %s", err)
 
-				// XXX we can't do this. when Run is in the ctx.Done
-				// branch, it is waiting for this goroutine to return.
-				// However, it cannot return, because it is waiting
-				// for Run to read from closedConnections.
-
-				// sess.closedConnections <- peer
+				select {
+				case sess.closedConnections <- peer:
+				case <-sess.closing:
+					// we're shutting down, so it's fine to drop this event on the floor
+				}
 			}()
 		case peer := <-sess.closedConnections:
 			// XXX fully close the peer connection
 			// XXX update per-torrent lists of peers
 			delete(sess.Peers, peer)
-		case <-ctx.Done():
-			log.Println("Run be done")
-			sess.torrentsWg.Wait()
-			log.Println("All torrents done")
-			sess.peersWg.Wait()
-			log.Println("All peers done")
-			return ctx.Err()
-
-			// XXX forcefully close all peer connections in case they're stuck in reads or writes
-			// XXX close listener to prevent new peers from connecting
+		case <-sess.closing:
+			for peer := range sess.Peers {
+				peer.Conn.Close()
+			}
+			return errClosing
 		}
 	}
 }

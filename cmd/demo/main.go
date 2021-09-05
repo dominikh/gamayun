@@ -8,24 +8,19 @@ import (
 	"os/signal"
 	"time"
 
-	"net/http"
-	_ "net/http/pprof"
-
 	"honnef.co/go/bittorrent"
 )
 
 func main() {
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
+	// go func() {
+	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
+	// }()
 
 	client := bittorrent.NewSession()
 
-	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		err := client.Run(ctx)
+		err := client.Run()
 		log.Println("Client terminated:", err)
-		os.Exit(0)
 	}()
 
 	sig := make(chan os.Signal, 1)
@@ -33,7 +28,8 @@ func main() {
 	go func() {
 		<-sig
 		log.Println("Shutting down")
-		cancel()
+		client.Shutdown(context.TODO())
+		panic("done")
 	}()
 
 	for _, arg := range os.Args[1:] {

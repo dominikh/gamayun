@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -170,7 +169,7 @@ func (msg Message) String() string {
 	}
 }
 
-func (conn *Connection) ReadMessage(ctx context.Context) (Message, error) {
+func (conn *Connection) ReadMessage() (Message, error) {
 	// XXX sensible timeout
 	conn.Conn.SetReadDeadline(time.Time{})
 	// OPT(dh): use fewer read calls/use buffering
