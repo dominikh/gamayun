@@ -352,6 +352,8 @@ func (peer *Peer) write(msg Message) error {
 	select {
 	case peer.writes <- msg:
 		return nil
+	case <-peer.done:
+		return nil
 	case <-peer.Session.closing:
 		return errClosing
 	}
@@ -360,6 +362,8 @@ func (peer *Peer) write(msg Message) error {
 func (peer *Peer) controlWrite(msg Message) error {
 	select {
 	case peer.controlWrites <- msg:
+		return nil
+	case <-peer.done:
 		return nil
 	case <-peer.Session.closing:
 		return errClosing
@@ -407,8 +411,8 @@ func (peer *Peer) blockReader() error {
 			if err != nil {
 				return err
 			}
-		case <-peer.Session.closing:
-			return errClosing
+		case <-peer.done:
+			return nil
 		}
 	}
 }
@@ -424,8 +428,8 @@ func (peer *Peer) readPeer() error {
 		case peer.msgs <- Message{
 			Message: msg,
 		}:
-		case <-peer.Session.closing:
-			return errClosing
+		case <-peer.done:
+			return nil
 		}
 	}
 }
@@ -454,8 +458,8 @@ func (peer *Peer) writePeer() error {
 			if err := writeMsg(msg); err != nil {
 				return err
 			}
-		case <-peer.Session.closing:
-			return errClosing
+		case <-peer.done:
+			return nil
 		}
 	}
 }
@@ -477,7 +481,10 @@ func (err WriteError) Unwrap() error {
 }
 
 func (sess *Session) RunPeer(peer *Peer) error {
-	defer peer.Conn.Close()
+	defer func() {
+		close(peer.done)
+		peer.Conn.Close()
+	}()
 
 	// XXX add handshake and peer id to DownloadedTotal stat
 	hash, err := peer.Conn.ReadHandshake()
@@ -513,6 +520,15 @@ func (sess *Session) RunPeer(peer *Peer) error {
 	case <-sess.closing:
 		return errClosing
 	}
+
+	errs := make(chan error, 1)
+	// OPT multiple reader goroutines?
+	//
+	// These goroutines will exit either when they encounter read/write errors on the connection or when Peer.done gets closed.
+	// This combination should ensure that the goroutines always terminate when RunPeer returns.
+	go func() { channel.TrySend(errs, peer.blockReader()) }()
+	go func() { channel.TrySend(errs, peer.readPeer()) }()
+	go func() { channel.TrySend(errs, peer.writePeer()) }()
 
 	// We've received their handshake and peer ID and have
 	// sent ours, now tell the peer which pieces we have
@@ -558,17 +574,12 @@ func (sess *Session) RunPeer(peer *Peer) error {
 		// XXX implement sending bitfield. don't forget to remove '|| true' from the previous condition
 	}
 
-	errs := make(chan error, 1)
-	// OPT multiple reader goroutines?
-	go func() { channel.TrySend(errs, peer.blockReader()) }()
-	go func() { channel.TrySend(errs, peer.readPeer()) }()
-	go func() { channel.TrySend(errs, peer.writePeer()) }()
-
 	t := time.NewTicker(time.Second)
 	for {
 		select {
 		case err := <-errs:
-			// This will also fire when we're shutting down, because blockReader, readPeer and writePeer will fail.
+			// This will also fire when we're shutting down, because blockReader, readPeer and writePeer will fail,
+			// because the peer connections will get closed by Session.Run
 			return err
 		case <-t.C:
 			if !peer.peerInterested && !peer.amChoking {
@@ -794,7 +805,6 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	}
 	sess.mu.Unlock()
 
-	// XXX forcefully close all peer connections
 	// XXX allow ctx to cancel waiting
 	sess.torrentsWg.Wait()
 	log.Println("All torrents done")
@@ -803,7 +813,6 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// XXX instead of giving Run a context, implement net/http.Server's model and have a Stop method instead. That way, the user can provide a separate timeout for the Stop operation.
 func (sess *Session) Run() error {
 	errs := make(chan error, 1)
 	go func() { errs <- sess.listen() }()
@@ -823,6 +832,7 @@ func (sess *Session) Run() error {
 				incomingRequests: make(chan Request, 256),
 				writes:           make(chan Message, 256),
 				controlWrites:    make(chan Message, 256),
+				done:             make(chan struct{}),
 
 				Have:           NewBitset(),
 				amInterested:   false,
@@ -845,7 +855,6 @@ func (sess *Session) Run() error {
 				}
 			}()
 		case peer := <-sess.closedConnections:
-			// XXX fully close the peer connection
 			// XXX update per-torrent lists of peers
 			delete(sess.Peers, peer)
 		case <-sess.closing:
@@ -913,6 +922,8 @@ type Peer struct {
 	// outgoing
 	controlWrites chan Message
 	writes        chan Message
+
+	done chan struct{}
 
 	// OPT: bitflags
 
