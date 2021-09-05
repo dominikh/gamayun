@@ -278,6 +278,10 @@ func (sess *Session) listen() error {
 			return err
 		}
 		pconn := protocol.NewConnection(conn)
+
+		// With regard to shutting down and closing peers, this is race-free.
+		// Either we're not yet shutting down, Session.Run will receive pconn and store it,
+		// or we're shutting down and we'll close the connection ourselves.
 		select {
 		case sess.incomingConnections <- pconn:
 		case <-sess.closing:
@@ -410,28 +414,6 @@ func (peer *Peer) blockReader() error {
 }
 
 func (peer *Peer) readPeer() error {
-	// XXX add handshake and peer id to DownloadedTotal stat
-
-	hash, err := peer.Conn.ReadHandshake()
-	if err != nil {
-		return err
-	}
-	select {
-	case peer.handshake <- hash:
-	case <-peer.Session.closing:
-		return errClosing
-	}
-
-	id, err := peer.Conn.ReadPeerID()
-	if err != nil {
-		return err
-	}
-	select {
-	case peer.peerID <- id:
-	case <-peer.Session.closing:
-		return errClosing
-	}
-
 	for {
 		msg, err := peer.Conn.ReadMessage()
 		if err != nil {
@@ -497,6 +479,85 @@ func (err WriteError) Unwrap() error {
 func (sess *Session) RunPeer(peer *Peer) error {
 	defer peer.Conn.Close()
 
+	// XXX add handshake and peer id to DownloadedTotal stat
+	hash, err := peer.Conn.ReadHandshake()
+	if err != nil {
+		return err
+	}
+	log.Println("got handshake from", peer)
+	// XXX don't allow connecting to stopped torrents
+	sess.lock()
+	torr, ok := sess.Torrents[hash]
+	sess.unlock()
+	if !ok {
+		return UnknownTorrentError{hash}
+	}
+	peer.Torrent = torr
+
+	if err := peer.Conn.SendHandshake(hash, sess.PeerID); err != nil {
+		return WriteError{err}
+	}
+
+	id, err := peer.Conn.ReadPeerID()
+	if err != nil {
+		return err
+	}
+	log.Println("got peer ID from", peer)
+	peer.PeerID = id
+
+	// Note that we send to torr.newPeers after we got the
+	// peer ID, not after the first half of the handshake, to
+	// avoid a race on peer.PeerID.
+	select {
+	case peer.Torrent.newPeers <- peer:
+	case <-sess.closing:
+		return errClosing
+	}
+
+	// We've received their handshake and peer ID and have
+	// sent ours, now tell the peer which pieces we have
+	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
+	torr.lock()
+	have := torr.Have.Copy()
+	torr.unlock()
+	peer.lastHaveSent = have
+	if have.count == 0 {
+		err := peer.write(Message{
+			Message: protocol.Message{
+				Type: protocol.MessageTypeHaveNone,
+			},
+		})
+		if err != nil {
+			return err
+		}
+	} else if have.count == torr.NumPieces() {
+		err := peer.write(Message{
+			Message: protocol.Message{
+				Type: protocol.MessageTypeHaveAll,
+			},
+		})
+		if err != nil {
+			return err
+		}
+	} else if have.count*haveMessageSize < torr.NumPieces()/8 || true {
+		// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
+		for i := 0; i < torr.NumPieces(); i++ {
+			if have.bits.Bit(i) != 0 {
+				err := peer.write(Message{
+					Message: protocol.Message{
+						Type:  protocol.MessageTypeHave,
+						Index: uint32(i),
+					},
+				})
+				if err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		// XXX implement sending bitfield. don't forget to remove '|| true' from the previous condition
+	}
+
 	errs := make(chan error, 1)
 	// OPT multiple reader goroutines?
 	go func() { channel.TrySend(errs, peer.blockReader()) }()
@@ -507,12 +568,9 @@ func (sess *Session) RunPeer(peer *Peer) error {
 	for {
 		select {
 		case err := <-errs:
+			// This will also fire when we're shutting down, because blockReader, readPeer and writePeer will fail.
 			return err
 		case <-t.C:
-			if !peer.setup {
-				continue
-			}
-
 			if !peer.peerInterested && !peer.amChoking {
 				peer.amChoking = true
 				err := peer.controlWrite(Message{
@@ -548,79 +606,6 @@ func (sess *Session) RunPeer(peer *Peer) error {
 			} else {
 				torr.unlock()
 			}
-
-		case hash := <-peer.handshake:
-			log.Println("got handshake from", peer)
-			// XXX don't allow connecting to stopped torrents
-			sess.lock()
-			torr, ok := sess.Torrents[hash]
-			sess.unlock()
-			if !ok {
-				return UnknownTorrentError{hash}
-			}
-			peer.Torrent = torr
-
-			if err := peer.Conn.SendHandshake(hash, sess.PeerID); err != nil {
-				return WriteError{err}
-			}
-		case id := <-peer.peerID:
-			log.Println("got peer ID from", peer)
-			peer.PeerID = id
-
-			// Note that we send to torr.newPeers after we got the
-			// peer ID, not after the first half of the handshake, to
-			// avoid a race on peer.PeerID.
-			select {
-			case peer.Torrent.newPeers <- peer:
-			case <-sess.closing:
-				return errClosing
-			}
-
-			// We've received their handshake and peer ID and have
-			// sent ours, now tell the peer which pieces we have
-			const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
-			torr := peer.Torrent
-			torr.lock()
-			have := torr.Have.Copy()
-			torr.unlock()
-			peer.lastHaveSent = have
-			if have.count == 0 {
-				err := peer.write(Message{
-					Message: protocol.Message{
-						Type: protocol.MessageTypeHaveNone,
-					},
-				})
-				if err != nil {
-					return err
-				}
-			} else if have.count == torr.NumPieces() {
-				err := peer.write(Message{
-					Message: protocol.Message{
-						Type: protocol.MessageTypeHaveAll,
-					},
-				})
-				if err != nil {
-					return err
-				}
-			} else if have.count*haveMessageSize < torr.NumPieces()/8 || true {
-				// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
-				for i := 0; i < torr.NumPieces(); i++ {
-					if have.bits.Bit(i) != 0 {
-						err := peer.write(Message{
-							Message: protocol.Message{
-								Type:  protocol.MessageTypeHave,
-								Index: uint32(i),
-							},
-						})
-						if err != nil {
-							return err
-						}
-					}
-				}
-			} else {
-				// XXX implement sending bitfield. don't forget to remove '|| true' from the previous condition
-			}
-
 		case msg := <-peer.msgs:
 			if !peer.setup {
 				switch msg.Type {
@@ -719,9 +704,6 @@ func (sess *Session) RunPeer(peer *Peer) error {
 					panic(fmt.Sprintf("unhandled message %s", msg))
 				}
 			}
-		case <-peer.Session.closing:
-			peer.Conn.Close()
-			return errClosing
 		}
 	}
 }
@@ -838,8 +820,6 @@ func (sess *Session) Run() error {
 
 				// OPT tweak buffers
 				msgs:             make(chan Message, 256),
-				handshake:        make(chan protocol.InfoHash),
-				peerID:           make(chan [20]byte),
 				incomingRequests: make(chan Request, 256),
 				writes:           make(chan Message, 256),
 				controlWrites:    make(chan Message, 256),
@@ -928,8 +908,6 @@ type Peer struct {
 
 	// incoming
 	msgs             chan Message
-	handshake        chan protocol.InfoHash
-	peerID           chan [20]byte
 	incomingRequests chan Request
 
 	// outgoing
