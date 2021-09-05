@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"time"
 
 	"net/http"
@@ -19,7 +20,21 @@ func main() {
 	}()
 
 	client := bittorrent.NewSession()
-	go client.Run(context.TODO())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		err := client.Run(ctx)
+		log.Println("Client terminated:", err)
+		os.Exit(0)
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		<-sig
+		log.Println("Shutting down")
+		cancel()
+	}()
 
 	for _, arg := range os.Args[1:] {
 		f, err := os.Open(arg)

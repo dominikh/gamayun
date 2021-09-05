@@ -67,8 +67,14 @@ type Session struct {
 	incomingConnections chan *protocol.Connection
 	closedConnections   chan *Peer
 
+	// The context passed to Session.Run, which gets used by Session.AddTorrent
+	ctx context.Context
+
 	// XXX check alignment on ARM
 	statistics Statistics
+
+	torrentsWg sync.WaitGroup
+	peersWg    sync.WaitGroup
 
 	mu       sync.RWMutex
 	Torrents map[protocol.InfoHash]*Torrent
@@ -151,6 +157,11 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 }
 
 func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
+	if _, ok := channel.TryRecv(sess.ctx.Done()); ok {
+		// Don't add new torrent to an already stopped client
+		return sess.ctx.Err()
+	}
+
 	// XXX check the torrent hasn't already been added
 
 	if err := sess.validateMetainfo(info); err != nil {
@@ -180,11 +191,17 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
 	sess.Torrents[torr.Hash] = torr
 	sess.unlock()
 
-	go sess.RunTorrent(context.TODO(), torr)
+	go func() {
+		sess.torrentsWg.Add(1)
+		defer sess.torrentsWg.Done()
+		sess.runTorrent(sess.ctx, torr)
+	}()
 	return nil
 }
 
 func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) (*TrackerResponse, error) {
+	log.Printf("announcing %q for %s", event, torr.Hash)
+
 	type AnnounceResponse struct {
 		Torrent  *Torrent
 		Response TrackerResponse
@@ -470,6 +487,10 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 		case err := <-errs:
 			return err
 		case <-t.C:
+			if !peer.setup {
+				continue
+			}
+
 			if !peer.peerInterested && !peer.amChoking {
 				peer.amChoking = true
 				peer.controlWrites <- Message{
@@ -657,10 +678,11 @@ func (sess *Session) RunPeer(ctx context.Context, peer *Peer) error {
 	}
 }
 
-func (sess *Session) RunTorrent(ctx context.Context, torr *Torrent) error {
+func (sess *Session) runTorrent(ctx context.Context, torr *Torrent) error {
 	torr.State = TorrentStateVerifying
 	torr.NextState = TorrentStateStopped
 
+	// XXX don't verify when calling runTorrent, instead make it a possible action on the torrent
 	// XXX disabled for debugging
 	if false {
 		t := time.Now()
@@ -688,14 +710,19 @@ func (sess *Session) RunTorrent(ctx context.Context, torr *Torrent) error {
 	torr.State = torr.NextState
 	torr.NextState = TorrentStateStopped
 
+	// XXX torrent should default to being stopped, getting started by an action
+	//
 	// XXX send "started" if we're not a seed. or even if we're a seed?
 	// TODO(dh): we probably shouldn't block trying to send the announce
-	tresp, err := sess.announce(ctx, torr, "")
+	tresp, err := sess.announce(context.TODO(), torr, "")
 	if err != nil {
 		// XXX
 		panic(err)
 	}
-	goon.Dump(tresp)
+	if false {
+		// XXX
+		goon.Dump(tresp)
+	}
 
 	// OPT(dh): disable ticker if we have no peers. there's no point in waking up thousands of torrents every second just to do nothing.
 	ticker := time.NewTicker(time.Second)
@@ -719,14 +746,18 @@ func (sess *Session) RunTorrent(ctx context.Context, torr *Torrent) error {
 			// XXX
 			_ = peer
 		case <-ctx.Done():
+			// XXX send event=stopped to tracker
 			return ctx.Err()
 		}
 	}
 }
 
+// XXX instead of giving Run a context, implement net/http.Server's model and have a Stop method instead. That way, the user can provide a separate timeout for the Stop operation.
 func (sess *Session) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	sess.ctx = ctx
 
 	errs := make(chan error, 1)
 	go func() { errs <- sess.listen(ctx) }()
@@ -758,16 +789,32 @@ func (sess *Session) Run(ctx context.Context) error {
 			sess.Peers[peer] = struct{}{}
 
 			go func() {
+				sess.peersWg.Add(1)
+				defer sess.peersWg.Done()
 				err := sess.RunPeer(ctx, peer)
 				log.Printf("peer failed: %s", err)
-				sess.closedConnections <- peer
+
+				// XXX we can't do this. when Run is in the ctx.Done
+				// branch, it is waiting for this goroutine to return.
+				// However, it cannot return, because it is waiting
+				// for Run to read from closedConnections.
+
+				// sess.closedConnections <- peer
 			}()
 		case peer := <-sess.closedConnections:
 			// XXX fully close the peer connection
 			// XXX update per-torrent lists of peers
 			delete(sess.Peers, peer)
 		case <-ctx.Done():
+			log.Println("Run be done")
+			sess.torrentsWg.Wait()
+			log.Println("All torrents done")
+			sess.peersWg.Wait()
+			log.Println("All peers done")
 			return ctx.Err()
+
+			// XXX forcefully close all peer connections in case they're stuck in reads or writes
+			// XXX close listener to prevent new peers from connecting
 		}
 	}
 }
