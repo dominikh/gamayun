@@ -1047,6 +1047,8 @@ func (set *Bitset) String() string {
 //
 // TODO: prioritize pieces we've already downloading
 type Pieces struct {
+	mu sync.Mutex
+
 	// mapping from piece to entry in sorted_pieces
 	pieceIndices []uint32
 
@@ -1072,6 +1074,9 @@ type Pieces struct {
 }
 
 func (t *Pieces) Inc(piece uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	avail := t.Priorities[piece]
 	t.buckets[avail]--
 	t.Priorities[piece]++
@@ -1089,6 +1094,9 @@ func (t *Pieces) Inc(piece uint32) {
 }
 
 func (t *Pieces) Dec(piece uint32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	t.Priorities[piece]--
 	avail := t.Priorities[piece]
 

@@ -192,6 +192,13 @@ func (conn *Connection) ReadMessage() (Message, error) {
 		return Message{}, err
 	}
 
+	copyb := func(b []byte) []byte {
+		// OPT(dh): reuse buffers. however, for that, the client would have to return them to us once its done with them.
+		out := make([]byte, len(b))
+		copy(out, b)
+		return out
+	}
+
 	// XXX verify that length matches message type
 	msg := Message{Type: MessageType(b[0])}
 	switch msg.Type {
@@ -202,7 +209,7 @@ func (conn *Connection) ReadMessage() (Message, error) {
 	case MessageTypeHave:
 		msg.Index = binary.BigEndian.Uint32(b[1:])
 	case MessageTypeBitfield:
-		msg.Data = b[1:]
+		msg.Data = copyb(b[1:])
 	case MessageTypeRequest:
 		msg.Index = binary.BigEndian.Uint32(b[1:])
 		msg.Begin = binary.BigEndian.Uint32(b[5:])
@@ -210,7 +217,7 @@ func (conn *Connection) ReadMessage() (Message, error) {
 	case MessageTypePiece:
 		msg.Index = binary.BigEndian.Uint32(b[1:])
 		msg.Begin = binary.BigEndian.Uint32(b[5:])
-		msg.Data = b[9:]
+		msg.Data = copyb(b[9:])
 	case MessageTypeCancel:
 		msg.Index = binary.BigEndian.Uint32(b[1:])
 		msg.Begin = binary.BigEndian.Uint32(b[5:])
