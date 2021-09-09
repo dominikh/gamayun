@@ -47,7 +47,6 @@ import (
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/protocol"
 
-	"github.com/shurcooL/go-goon"
 	"github.com/zeebo/bencode"
 )
 
@@ -71,8 +70,7 @@ type Session struct {
 	// XXX check alignment on ARM
 	statistics Statistics
 
-	torrentsWg sync.WaitGroup
-	peersWg    sync.WaitGroup
+	peersWg sync.WaitGroup
 
 	mu       sync.RWMutex
 	closing  chan struct{}
@@ -127,7 +125,7 @@ func NewSession() *Session {
 	}
 }
 
-func Verify(data []byte, checksum []byte) bool {
+func verifyBlock(data []byte, checksum []byte) bool {
 	h := sha1.Sum(data)
 	return bytes.Equal(h[:], checksum)
 }
@@ -158,23 +156,23 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 	// XXX prevent directory traversal in info.Info.Name
 }
 
-func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
+func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torrent, error) {
 	if _, ok := channel.TryRecv(sess.closing); ok {
 		// Don't add new torrent to an already stopped client
-		return errClosing
+		return nil, errClosing
 	}
 
 	// XXX check the torrent hasn't already been added
 
 	if err := sess.validateMetainfo(info); err != nil {
-		return fmt.Errorf("torrent failed validation: %w", err)
+		return nil, fmt.Errorf("torrent failed validation: %w", err)
 	}
 
 	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
 		Have:     NewBitset(),
-		newPeers: make(chan *Peer),
+		session:  sess,
 	}
 
 	n := uint32(torr.NumPieces())
@@ -193,13 +191,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) error {
 	sess.Torrents[torr.Hash] = torr
 	sess.unlock()
 
-	// XXX there is a race here. Shutdown's wg.Wait can finish before we increment the wg
-	sess.torrentsWg.Add(1)
-	go func() {
-		defer sess.torrentsWg.Done()
-		sess.runTorrent(torr)
-	}()
-	return nil
+	return torr, nil
 }
 
 func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) (*TrackerResponse, error) {
@@ -299,53 +291,6 @@ type HandshakeMessage struct {
 type PeerIDMessage struct {
 	Peer   *Peer
 	PeerID [20]byte
-}
-
-func verifyTorrent(torr *Torrent) (Bitset, error) {
-	// OPT use more than one goroutine to verify in parallel; we get about 1 GB/s on one core
-	pieceSize := torr.Metainfo.Info.PieceLength
-	numPieces := torr.NumPieces()
-	// XXX support multi-file mode
-	name := torr.Metainfo.Info.Name
-
-	f, err := os.Open(name)
-	if err != nil {
-		return Bitset{}, err
-	}
-	defer f.Close()
-
-	bits := NewBitset()
-	buf := make([]byte, pieceSize)
-	piece := uint32(0)
-	for {
-		n, err := io.ReadFull(f, buf)
-		if err != nil {
-			if err == io.ErrUnexpectedEOF {
-				if piece+1 != uint32(numPieces) {
-					break
-				} else {
-					buf = buf[:n]
-				}
-			} else if err == io.EOF {
-				break
-			} else {
-				return Bitset{}, err
-			}
-		}
-
-		off := piece * 20
-		if Verify(buf, torr.Metainfo.Info.Pieces[off:off+20]) {
-			bits.Set(piece)
-		}
-
-		piece++
-	}
-	return bits, err
-}
-
-type VerifiedTorrent struct {
-	Torrent *Torrent
-	Have    Bitset
 }
 
 func (peer *Peer) write(msg Message) error {
@@ -480,7 +425,7 @@ func (err WriteError) Unwrap() error {
 	return err.error
 }
 
-func (sess *Session) RunPeer(peer *Peer) error {
+func (sess *Session) runPeer(peer *Peer) error {
 	defer func() {
 		close(peer.done)
 		peer.Conn.Close()
@@ -511,15 +456,6 @@ func (sess *Session) RunPeer(peer *Peer) error {
 	}
 	log.Println("got peer ID from", peer)
 	peer.PeerID = id
-
-	// Note that we send to torr.newPeers after we got the
-	// peer ID, not after the first half of the handshake, to
-	// avoid a race on peer.PeerID.
-	select {
-	case peer.Torrent.newPeers <- peer:
-	case <-sess.closing:
-		return errClosing
-	}
 
 	errs := make(chan error, 1)
 	// OPT multiple reader goroutines?
@@ -719,6 +655,7 @@ func (sess *Session) RunPeer(peer *Peer) error {
 	}
 }
 
+/*
 func (sess *Session) runTorrent(torr *Torrent) error {
 	torr.State = TorrentStateVerifying
 	torr.NextState = TorrentStateStopped
@@ -753,39 +690,13 @@ func (sess *Session) runTorrent(torr *Torrent) error {
 
 	// XXX torrent should default to being stopped, getting started by an action
 	//
-	// XXX send "started" if we're not a seed. or even if we're a seed?
-	// TODO(dh): we probably shouldn't block trying to send the announce
-	tresp, err := sess.announce(context.TODO(), torr, "")
-	if err != nil {
-		// XXX
-		panic(err)
-	}
-	if false {
-		// XXX
-		goon.Dump(tresp)
-	}
 
 	// OPT(dh): disable ticker if we have no peers. there's no point in waking up thousands of torrents every second just to do nothing.
 	ticker := time.NewTicker(time.Second)
-	announcer := time.NewTicker(30 * time.Minute) // XXX use actual announce interval
 	for {
 		select {
-		case <-announcer.C:
-			// TODO(dh): we probably shouldn't block trying to send the announce. especially not if we're shutting down
-			tresp, err := sess.announce(context.TODO(), torr, "")
-			if err != nil {
-				// TODO(dh): try to announce again soon, don't wait for the next planned announc
-				log.Printf("failed announcing %s to %s: %s", torr.Hash, torr.Metainfo.Announce, err)
-				continue
-			}
-			// XXX do something with the response
-			goon.Dump(tresp)
 		case <-ticker.C:
 			// XXX
-		case peer := <-torr.newPeers:
-			log.Printf("new peer %s for torrent %s", peer, torr)
-			// XXX
-			_ = peer
 		case <-sess.closing:
 			// XXX respect Shutdown timing out, handle announce failing and retry
 			sess.announce(context.TODO(), torr, "stopped")
@@ -793,6 +704,7 @@ func (sess *Session) runTorrent(torr *Torrent) error {
 		}
 	}
 }
+*/
 
 func (sess *Session) Shutdown(ctx context.Context) error {
 	log.Println("Shutting down")
@@ -805,9 +717,16 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	}
 	sess.mu.Unlock()
 
+	for _, torr := range sess.Torrents {
+		if torr.Action != nil {
+			torr.Action.Stop()
+		}
+	}
+
 	// XXX allow ctx to cancel waiting
-	sess.torrentsWg.Wait()
-	log.Println("All torrents done")
+	// sess.torrentsWg.Wait()
+	// log.Println("All torrents done")
+
 	sess.peersWg.Wait()
 	log.Println("All peers done")
 	return nil
@@ -845,7 +764,7 @@ func (sess *Session) Run() error {
 			sess.peersWg.Add(1)
 			go func() {
 				defer sess.peersWg.Done()
-				err := sess.RunPeer(peer)
+				err := sess.runPeer(peer)
 				log.Printf("peer failed: %s", err)
 
 				select {
@@ -885,10 +804,10 @@ type Torrent struct {
 	Peers        []*Peer
 	Availability Pieces
 
-	State     TorrentState
-	NextState TorrentState
+	State  TorrentState
+	Action Action
 
-	newPeers chan *Peer
+	session *Session
 
 	mu sync.RWMutex
 	// Pieces we have
@@ -1109,4 +1028,160 @@ func (t *Pieces) Dec(piece uint32) {
 
 	t.SortedPieces[other_index], t.SortedPieces[index] = t.SortedPieces[index], t.SortedPieces[other_index]
 	t.pieceIndices[other_piece], t.pieceIndices[piece] = t.pieceIndices[piece], t.pieceIndices[other_piece]
+}
+
+type Action interface {
+	Run() (result interface{}, stopped bool, err error)
+	Pause()
+	Stop()
+}
+
+type action struct {
+	torr    *Torrent
+	pause   chan struct{}
+	stop    chan struct{}
+	unpause chan struct{}
+}
+
+func (l *action) Pause()   { channel.TrySend(l.pause, struct{}{}) }
+func (l *action) Unpause() { channel.TrySend(l.unpause, struct{}{}) }
+func (l *action) Stop()    { channel.TrySend(l.stop, struct{}{}) }
+
+type Verify struct {
+	action
+}
+
+func (l *Verify) Run() (result interface{}, stopped bool, err error) {
+	log.Println("started verifying", l.torr)
+	defer func() {
+		if stopped {
+			log.Println("stopped verifying", l.torr)
+		} else {
+			log.Println("finished verifying", l.torr)
+		}
+	}()
+
+	// OPT use more than one goroutine to verify in parallel; we get about 1 GB/s on one core
+	pieceSize := l.torr.Metainfo.Info.PieceLength
+	numPieces := l.torr.NumPieces()
+	// XXX support multi-file mode
+	name := l.torr.Metainfo.Info.Name
+
+	res := NewBitset()
+
+	f, err := os.Open(name)
+	if err != nil {
+		return res, false, nil
+	}
+	defer f.Close()
+
+	buf := make([]byte, pieceSize)
+	piece := uint32(0)
+
+	for {
+		select {
+		case <-l.pause:
+			<-l.unpause
+		case <-l.stop:
+			return res, true, nil
+		default:
+		}
+
+		n, err := io.ReadFull(f, buf)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				if piece+1 != uint32(numPieces) {
+					break
+				} else {
+					buf = buf[:n]
+				}
+			} else if err == io.EOF {
+				break
+			} else {
+				// XXX report the error
+				return res, false, err
+			}
+		}
+
+		off := piece * 20
+		if verifyBlock(buf, l.torr.Metainfo.Info.Pieces[off:off+20]) {
+			res.Set(piece)
+		}
+
+		piece++
+	}
+
+	return res, false, nil
+}
+
+// type Active struct {
+// 	action
+// }
+
+// func (l *Active) Run() (done bool) {
+// 	// OPT all torrents can probably be driven by a single goroutine
+
+// 	torr := l.torr
+// 	sess := l.torr.session
+
+// 	// XXX send "started" if we're not a seed. or even if we're a seed?
+// 	// TODO(dh): we probably shouldn't block trying to send the announce
+// 	tresp, err := sess.announce(context.TODO(), torr, "")
+// 	if err != nil {
+// 		// XXX
+// 		panic(err)
+// 	}
+// 	if false {
+// 		// XXX
+// 		goon.Dump(tresp)
+// 	}
+
+// 	announcer := time.NewTicker(30 * time.Minute) // XXX use actual announce interval
+// 	defer announcer.Stop()
+
+// 	for {
+// 		select {
+// 		case <-l.pause:
+// 			// XXX send stop announce, kill peers
+// 			<-l.unpause
+// 		case <-l.stop:
+// 			// XXX send stop announce, kill peers
+// 			return false
+// 		case <-announcer.C:
+// 			// TODO(dh): we probably shouldn't block trying to send the announce. especially not if we're shutting down
+// 			// XXX global rate limit of announces
+// 			tresp, err := sess.announce(context.TODO(), torr, "")
+// 			if err != nil {
+// 				// TODO(dh): try to announce again soon, don't wait for the next planned announc
+// 				log.Printf("failed announcing %s to %s: %s", torr.Hash, torr.Metainfo.Announce, err)
+// 				continue
+// 			}
+// 			// XXX do something with the response
+// 			goon.Dump(tresp)
+// 		}
+// 	}
+// }
+
+func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
+	if torr.Action != nil {
+		// XXX Stop is asynchronous, make it synchronous and wait
+		torr.Action.Stop()
+	}
+	torr.Action = l
+	// XXX
+	res, stopped, err := torr.Action.Run()
+	torr.Action = nil
+
+	return res, stopped, err
+}
+
+func NewVerify(torr *Torrent) Action {
+	return &Verify{
+		action: action{
+			torr:    torr,
+			pause:   make(chan struct{}, 1),
+			stop:    make(chan struct{}, 1),
+			unpause: make(chan struct{}, 1),
+		},
+	}
 }

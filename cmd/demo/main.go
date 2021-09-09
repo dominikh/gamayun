@@ -29,7 +29,7 @@ func main() {
 		<-sig
 		log.Println("Shutting down")
 		client.Shutdown(context.TODO())
-		panic("done")
+		os.Exit(0)
 	}()
 
 	for _, arg := range os.Args[1:] {
@@ -44,9 +44,22 @@ func main() {
 			log.Fatal(err)
 		}
 
-		if err := client.AddTorrent(minfo, infoHash); err != nil {
+		torr, err := client.AddTorrent(minfo, infoHash)
+		if err != nil {
 			log.Printf("could not add torrent %2x: %s", infoHash, err)
 		}
+
+		go func() {
+			l := bittorrent.NewVerify(torr)
+			result, stopped, err := torr.RunAction(l)
+			log.Println(result, stopped, err)
+			if err != nil {
+
+			}
+			if stopped {
+			} else {
+			}
+		}()
 	}
 
 	t := time.NewTicker(5 * time.Second)
