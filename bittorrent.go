@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/container"
 	"honnef.co/go/bittorrent/protocol"
 
 	"github.com/zeebo/bencode"
@@ -72,7 +73,7 @@ type Session struct {
 	mu       sync.RWMutex
 	listener net.Listener
 	Torrents map[protocol.InfoHash]*Torrent
-	Peers    map[*Peer]struct{}
+	peers    container.Set[*Peer]
 }
 
 func (sess *Session) Statistics() Statistics {
@@ -108,7 +109,7 @@ func NewSession() *Session {
 		PeerID:   [20]byte{123, 123, 126, 36, 123, 42, 122},
 		Settings: DefaultSettings,
 		Torrents: map[protocol.InfoHash]*Torrent{},
-		Peers:    map[*Peer]struct{}{},
+		peers:    container.NewSet[*Peer](),
 		closing:  make(chan struct{}),
 	}
 }
@@ -156,6 +157,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		Hash:     hash,
 		Have:     NewBitset(),
 		session:  sess,
+		peers:    container.NewSet[*Peer](),
 	}
 
 	n := uint32(torr.NumPieces())
@@ -282,7 +284,7 @@ func (sess *Session) listen() error {
 			peerInterested: false,
 			peerChoking:    true,
 		}
-		sess.Peers[peer] = struct{}{}
+		sess.peers.Add(peer)
 
 		sess.peersWg.Add(1)
 		sess.mu.Unlock()
@@ -293,8 +295,7 @@ func (sess *Session) listen() error {
 
 			sess.mu.Lock()
 			defer sess.mu.Unlock()
-			// XXX update per-torrent lists of peers
-			delete(sess.Peers, peer)
+			sess.peers.Delete(peer)
 		}()
 	}
 }
@@ -433,6 +434,14 @@ func (err UnknownTorrentError) Error() string {
 	return fmt.Sprintf("unknown torrent %s", err.hash)
 }
 
+type StoppedTorrentError struct {
+	hash protocol.InfoHash
+}
+
+func (err StoppedTorrentError) Error() string {
+	return fmt.Sprintf("stopped torrent %s", err.hash)
+}
+
 type WriteError struct {
 	error
 }
@@ -453,13 +462,31 @@ func (sess *Session) runPeer(peer *Peer) error {
 		return err
 	}
 	log.Println("got handshake from", peer)
-	// XXX don't allow connecting to stopped torrents
 	sess.mu.RLock()
 	torr, ok := sess.Torrents[hash]
 	sess.mu.RUnlock()
 	if !ok {
 		return UnknownTorrentError{hash}
 	}
+
+	// XXX once we support removing torrents, this will race
+
+	torr.mu.Lock()
+	if torr.State == TorrentStateStopped {
+		// Don't let peers connect to stopped torrents
+		peer.Conn.Close()
+		torr.mu.Unlock()
+		return StoppedTorrentError{hash}
+	}
+	torr.peers.Add(peer)
+	torr.mu.Unlock()
+
+	defer func() {
+		torr.mu.Lock()
+		defer torr.mu.Unlock()
+		torr.peers.Delete(peer)
+	}()
+
 	peer.Torrent = torr
 
 	if err := peer.Conn.SendHandshake(hash, sess.PeerID); err != nil {
@@ -735,7 +762,7 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	for _, torr := range sess.Torrents {
 		torr.Stop(ctx)
 	}
-	for peer := range sess.Peers {
+	for peer := range sess.peers {
 		peer.Conn.Close()
 	}
 	sess.mu.Unlock()
@@ -771,17 +798,17 @@ const (
 type Torrent struct {
 	Metainfo     *Metainfo
 	Hash         protocol.InfoHash
-	Peers        []*Peer
 	Availability Pieces
 
-	State  TorrentState
 	Action Action
 
 	session *Session
 
 	mu sync.RWMutex
 	// Pieces we have
-	Have Bitset
+	Have  Bitset
+	State TorrentState
+	peers container.Set[*Peer]
 }
 
 func (torr *Torrent) Start() {
@@ -793,12 +820,14 @@ func (torr *Torrent) Start() {
 		return
 	}
 
+	torr.mu.Lock()
 	if torr.IsComplete() {
 		torr.State = TorrentStateSeeding
 	} else {
 		torr.State = TorrentStateLeeching
 		panic("XXX: we cannot download torrents yet")
 	}
+	torr.mu.Unlock()
 
 	// XXX initialize new stats for this "session" (delimieted by a start and stop announce)
 	// XXX allow interrupting the announce
@@ -809,10 +838,26 @@ func (torr *Torrent) Stop(ctx context.Context) {
 	if torr.Action != nil {
 		torr.Action.Stop()
 	} else {
-		// XXX implement
+		// XXX how should this handle an in-progress announce?
 
-		// updateState()
-		// killOurPeers()
+		torr.mu.Lock()
+		defer torr.mu.Unlock()
+		if torr.State != TorrentStateStopped {
+			torr.State = TorrentStateStopped
+
+			for peer := range torr.peers {
+				// Right now this won't deadlock. runPeer runs in its
+				// own goroutine, so even though it needs to hold the
+				// same mutex as Torrent.Stop, it'll happily wait for
+				// Stop to return first. However, if we were to wait
+				// for runPeer to return before returning from Stop,
+				// we'd have a deadlock.
+				peer.Conn.Close()
+
+			}
+
+			// XXX send final announce
+		}
 	}
 }
 
@@ -1168,10 +1213,9 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 // }
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
-	if torr.Action != nil {
-		// XXX Stop is asynchronous, make it synchronous and wait
-		torr.Action.Stop()
-	}
+	// XXX Stop is asynchronous, make it synchronous and wait
+	// XXX allow timing this out?
+	torr.Stop(context.Background())
 	torr.Action = l
 	res, stopped, err := torr.Action.Run()
 	torr.Action = nil
