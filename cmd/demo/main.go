@@ -54,10 +54,15 @@ func main() {
 			result, stopped, err := torr.RunAction(l)
 			log.Println(result, stopped, err)
 			if err != nil {
-
+				// XXX
 			}
 			if stopped {
+				// XXX
 			} else {
+				torr.SetHave(result.(bittorrent.Bitset))
+				if torr.IsComplete() {
+					torr.Start()
+				}
 			}
 		}()
 	}

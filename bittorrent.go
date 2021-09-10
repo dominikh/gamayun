@@ -62,7 +62,7 @@ type Session struct {
 	Settings Settings
 
 	PeerID [20]byte
-	Peers  map[*Peer]struct{}
+	Peers  map[*Peer]struct{} // owned by Session.Run
 
 	incomingConnections chan *protocol.Connection
 	closedConnections   chan *Peer
@@ -72,8 +72,8 @@ type Session struct {
 
 	peersWg sync.WaitGroup
 
-	mu       sync.RWMutex
 	closing  chan struct{}
+	mu       sync.RWMutex
 	listener net.Listener
 	Torrents map[protocol.InfoHash]*Torrent
 }
@@ -104,11 +104,6 @@ type Settings struct {
 	ListenAddress          string
 	ListenPort             string // TODO support port ranges
 }
-
-func (sess *Session) lock()    { sess.mu.Lock() }
-func (sess *Session) rlock()   { sess.mu.RLock() }
-func (sess *Session) unlock()  { sess.mu.Unlock() }
-func (sess *Session) runlock() { sess.mu.RLock() }
 
 func NewSession() *Session {
 	return &Session{
@@ -157,11 +152,6 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 }
 
 func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torrent, error) {
-	if _, ok := channel.TryRecv(sess.closing); ok {
-		// Don't add new torrent to an already stopped client
-		return nil, errClosing
-	}
-
 	// XXX check the torrent hasn't already been added
 
 	if err := sess.validateMetainfo(info); err != nil {
@@ -187,9 +177,13 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		torr.Availability.SortedPieces[i] = i
 	}
 
-	sess.lock()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if _, ok := channel.TryRecv(sess.closing); ok {
+		// Don't add new torrent to an already stopped client
+		return nil, errClosing
+	}
 	sess.Torrents[torr.Hash] = torr
-	sess.unlock()
 
 	return torr, nil
 }
@@ -438,9 +432,9 @@ func (sess *Session) runPeer(peer *Peer) error {
 	}
 	log.Println("got handshake from", peer)
 	// XXX don't allow connecting to stopped torrents
-	sess.lock()
+	sess.mu.RLock()
 	torr, ok := sess.Torrents[hash]
-	sess.unlock()
+	sess.mu.RUnlock()
 	if !ok {
 		return UnknownTorrentError{hash}
 	}
@@ -469,9 +463,9 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// We've received their handshake and peer ID and have
 	// sent ours, now tell the peer which pieces we have
 	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
-	torr.lock()
+	torr.mu.RLock()
 	have := torr.Have.Copy()
-	torr.unlock()
+	torr.mu.RUnlock()
 	peer.lastHaveSent = have
 	if have.count == 0 {
 		err := peer.write(Message{
@@ -542,16 +536,16 @@ func (sess *Session) runPeer(peer *Peer) error {
 			}
 
 			torr := peer.Torrent
-			torr.lock()
+			torr.mu.RLock()
 			if torr.Have.count != peer.lastHaveSent.count {
 				have := torr.Have.Copy()
-				torr.unlock()
+				torr.mu.RUnlock()
 
 				// XXX find diff between lastHaveSent and have, send Have messages
 
 				peer.lastHaveSent = have
 			} else {
-				torr.unlock()
+				torr.mu.RUnlock()
 			}
 		case msg := <-peer.msgs:
 			if !peer.setup {
@@ -715,13 +709,11 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	if sess.listener != nil {
 		sess.listener.Close()
 	}
-	sess.mu.Unlock()
 
 	for _, torr := range sess.Torrents {
-		if torr.Action != nil {
-			torr.Action.Stop()
-		}
+		torr.Stop(ctx)
 	}
+	sess.mu.Unlock()
 
 	// XXX allow ctx to cancel waiting
 	// sess.torrentsWg.Wait()
@@ -794,8 +786,8 @@ type TorrentState uint8
 
 const (
 	TorrentStateStopped TorrentState = iota
-	TorrentStateVerifying
-	TorrentStateStarted
+	TorrentStateLeeching
+	TorrentStateSeeding
 )
 
 type Torrent struct {
@@ -814,14 +806,48 @@ type Torrent struct {
 	Have Bitset
 }
 
+func (torr *Torrent) Start() {
+	if torr.State != TorrentStateStopped {
+		return
+	}
+
+	if torr.Action != nil {
+		return
+	}
+
+	if torr.IsComplete() {
+		torr.State = TorrentStateSeeding
+	} else {
+		torr.State = TorrentStateLeeching
+		panic("XXX: we cannot download torrents yet")
+	}
+
+	// XXX initialize new stats for this "session" (delimieted by a start and stop announce)
+	// XXX send announce
+}
+
+func (torr *Torrent) Stop(ctx context.Context) {
+	panic("XXX: we cannot stop torrents yet")
+
+	if torr.Action != nil {
+		torr.Action.Stop()
+	} else {
+		// updateState()
+		// killOurPeers()
+	}
+}
+
 func (torr *Torrent) String() string {
 	return torr.Hash.String()
 }
 
-func (torr *Torrent) lock()    { torr.mu.Lock() }
-func (torr *Torrent) rlock()   { torr.mu.RLock() }
-func (torr *Torrent) unlock()  { torr.mu.Unlock() }
-func (torr *Torrent) runlock() { torr.mu.RUnlock() }
+func (torr *Torrent) IsComplete() bool {
+	return torr.Have.count == torr.NumPieces()
+}
+
+func (torr *Torrent) SetHave(have Bitset) {
+	torr.Have = have
+}
 
 func (torr *Torrent) NumPieces() int {
 	a := torr.Metainfo.Info.Length
@@ -1168,7 +1194,6 @@ func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 		torr.Action.Stop()
 	}
 	torr.Action = l
-	// XXX
 	res, stopped, err := torr.Action.Run()
 	torr.Action = nil
 
