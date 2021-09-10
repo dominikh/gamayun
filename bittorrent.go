@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,7 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 
 	"github.com/zeebo/bencode"
+	"go4.org/readerutil"
 )
 
 type Statistics struct {
@@ -120,8 +122,19 @@ func verifyBlock(data []byte, checksum []byte) bool {
 }
 
 func (sess *Session) validateMetainfo(info *Metainfo) error {
-	a := info.Info.Length
+	var a uint64
+	if len(info.Info.Files) == 0 {
+		// single-file mode
+		a = info.Info.Length
+	} else {
+		// multi-file mode
+		for _, f := range info.Info.Files {
+			a += f.Length
+		}
+	}
+
 	b := info.Info.PieceLength
+
 	// XXX theoretically, this can overflow. practically it never will
 	numPieces := int((a + b - 1) / b)
 
@@ -159,6 +172,38 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		session:  sess,
 		peers:    container.NewSet[*Peer](),
 	}
+
+	// XXX ensure the on-disk files are of the right lengths
+
+	// XXX don't require all files in a torrent to always be open. open them lazily.
+	var files []readerutil.SizeReaderAt
+	// io.NewSectionReader(f, 0, int64(info.Info.Length))
+	if len(info.Info.Files) == 0 {
+		// single-file mode
+		f, err := os.Open(info.Info.Name)
+		if err != nil {
+			// XXX don't depend on the file already existing; create it if needed, as a sparse file
+			return nil, err
+		}
+		files = append(files, io.NewSectionReader(f, 0, int64(info.Info.Length)))
+	} else {
+		// multi-file mode
+		var osFiles []*os.File
+		for _, fe := range info.Info.Files {
+			// XXX prevent directory traversal
+			f, err := os.Open(filepath.Join(fe.Path...))
+			if err != nil {
+				for _, f := range osFiles {
+					f.Close()
+				}
+				// XXX don't depend on the file already existing; create it if needed, as a sparse file
+				return nil, err
+			}
+			files = append(files, io.NewSectionReader(f, 0, int64(fe.Length)))
+			osFiles = append(osFiles, f)
+		}
+	}
+	torr.data = readerutil.NewMultiReaderAt(files...)
 
 	n := uint32(torr.NumPieces())
 	torr.Availability = Pieces{
@@ -206,7 +251,7 @@ func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) 
 	q["port"] = []string{sess.Settings.ListenPort}
 	q["uploaded"] = []string{"0"}
 	q["downloaded"] = []string{"0"}
-	// XXX support multi file mode
+	// XXX support multi-file mode
 	// q["left"] = []string{strconv.FormatUint(areq.Torrent.Metainfo.Info.Length, 10)}
 	q["left"] = []string{"0"}
 	q["numwant"] = []string{"200"}
@@ -338,22 +383,11 @@ func (peer *Peer) blockReader() error {
 		case req := <-peer.incomingRequests:
 			// OPT use channel.Collect and try to coalesce reads
 			err := func() error {
-				f, err := os.Open(peer.Torrent.Metainfo.Info.Name)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-
 				// OPT: cache pieces(?)
-				_, err = f.Seek(int64(req.Index)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin), io.SeekStart)
-				if err != nil {
-					return err
-				}
-
 				// XXX make sure req.Length isn't too long
 				// OPT reuse buffers
 				buf := make([]byte, req.Length)
-				_, err = io.ReadFull(f, buf)
+				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
 				if err != nil {
 					return err
 				}
@@ -750,6 +784,10 @@ func (sess *Session) runTorrent(torr *Torrent) error {
 */
 
 func (sess *Session) Shutdown(ctx context.Context) error {
+	// XXX close all the files in all the torrents. although, once we
+	// have lazy file opening, this should happen in Torrent.Stop
+	// instead.
+
 	log.Println("Shutting down")
 	defer log.Println("Shut down")
 
@@ -800,6 +838,8 @@ type Torrent struct {
 	Hash         protocol.InfoHash
 	Availability Pieces
 
+	data io.ReaderAt
+
 	Action Action
 
 	session *Session
@@ -831,6 +871,10 @@ func (torr *Torrent) Start() {
 
 	// XXX initialize new stats for this "session" (delimieted by a start and stop announce)
 	// XXX allow interrupting the announce
+	// XXX is "started" the right event to send when we're a seeder?
+	// XXX get announce interval from response
+	// XXX handle announce failure
+	// XXX process the list of peers
 	torr.session.announce(context.Background(), torr, "started")
 }
 
@@ -874,7 +918,17 @@ func (torr *Torrent) SetHave(have Bitset) {
 }
 
 func (torr *Torrent) NumPieces() int {
-	a := torr.Metainfo.Info.Length
+	var a uint64
+	if len(torr.Metainfo.Info.Files) == 0 {
+		// single-file mode
+		a = torr.Metainfo.Info.Length
+	} else {
+		// multi-file mode
+		for _, f := range torr.Metainfo.Info.Files {
+			a += f.Length
+		}
+	}
+
 	b := torr.Metainfo.Info.PieceLength
 	// XXX theoretically, this can overflow. practically it never will
 	return int((a + b - 1) / b)
@@ -1114,16 +1168,12 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 	// OPT use more than one goroutine to verify in parallel; we get about 1 GB/s on one core
 	pieceSize := l.torr.Metainfo.Info.PieceLength
 	numPieces := l.torr.NumPieces()
-	// XXX support multi-file mode
-	name := l.torr.Metainfo.Info.Name
 
 	res := NewBitset()
 
-	f, err := os.Open(name)
-	if err != nil {
-		return res, false, nil
-	}
-	defer f.Close()
+	// OPT use a normal MultiReader to avoid the unnecessary cost of
+	// mapping from piece to file. We just want to read everything
+	// sequentially.
 
 	buf := make([]byte, pieceSize)
 	piece := uint32(0)
@@ -1137,7 +1187,7 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 		default:
 		}
 
-		n, err := io.ReadFull(f, buf)
+		n, err := l.torr.data.ReadAt(buf, int64(piece)*int64(pieceSize))
 		if err != nil {
 			if err == io.ErrUnexpectedEOF {
 				if piece+1 != uint32(numPieces) {
@@ -1164,39 +1214,10 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 	return res, false, nil
 }
 
-// type Active struct {
-// 	action
-// }
-
-// func (l *Active) Run() (done bool) {
-// 	// OPT all torrents can probably be driven by a single goroutine
-
-// 	torr := l.torr
-// 	sess := l.torr.session
-
-// 	// XXX send "started" if we're not a seed. or even if we're a seed?
-// 	// TODO(dh): we probably shouldn't block trying to send the announce
-// 	tresp, err := sess.announce(context.TODO(), torr, "")
-// 	if err != nil {
-// 		// XXX
-// 		panic(err)
-// 	}
-// 	if false {
-// 		// XXX
-// 		goon.Dump(tresp)
-// 	}
-
 // 	announcer := time.NewTicker(30 * time.Minute) // XXX use actual announce interval
 // 	defer announcer.Stop()
-
+//
 // 	for {
-// 		select {
-// 		case <-l.pause:
-// 			// XXX send stop announce, kill peers
-// 			<-l.unpause
-// 		case <-l.stop:
-// 			// XXX send stop announce, kill peers
-// 			return false
 // 		case <-announcer.C:
 // 			// TODO(dh): we probably shouldn't block trying to send the announce. especially not if we're shutting down
 // 			// XXX global rate limit of announces

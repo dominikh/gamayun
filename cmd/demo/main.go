@@ -47,6 +47,7 @@ func main() {
 		torr, err := client.AddTorrent(minfo, infoHash)
 		if err != nil {
 			log.Printf("could not add torrent %2x: %s", infoHash, err)
+			continue
 		}
 
 		go func() {
