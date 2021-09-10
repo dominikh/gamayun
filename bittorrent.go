@@ -62,10 +62,6 @@ type Session struct {
 	Settings Settings
 
 	PeerID [20]byte
-	Peers  map[*Peer]struct{} // owned by Session.Run
-
-	incomingConnections chan *protocol.Connection
-	closedConnections   chan *Peer
 
 	// XXX check alignment on ARM
 	statistics Statistics
@@ -76,6 +72,7 @@ type Session struct {
 	mu       sync.RWMutex
 	listener net.Listener
 	Torrents map[protocol.InfoHash]*Torrent
+	Peers    map[*Peer]struct{}
 }
 
 func (sess *Session) Statistics() Statistics {
@@ -112,11 +109,7 @@ func NewSession() *Session {
 		Settings: DefaultSettings,
 		Torrents: map[protocol.InfoHash]*Torrent{},
 		Peers:    map[*Peer]struct{}{},
-		// XXX optimize all these buffer sizes
-		// incomingCOnnections has to be unbuffered so that every incoming connection either gets handled or closed.
-		incomingConnections: make(chan *protocol.Connection),
-		closedConnections:   make(chan *Peer),
-		closing:             make(chan struct{}),
+		closing:  make(chan struct{}),
 	}
 }
 
@@ -265,15 +258,44 @@ func (sess *Session) listen() error {
 		}
 		pconn := protocol.NewConnection(conn)
 
-		// With regard to shutting down and closing peers, this is race-free.
-		// Either we're not yet shutting down, Session.Run will receive pconn and store it,
-		// or we're shutting down and we'll close the connection ourselves.
-		select {
-		case sess.incomingConnections <- pconn:
-		case <-sess.closing:
+		sess.mu.Lock()
+		if _, ok := channel.TryRecv(sess.closing); ok {
+			// We're shutting down, discard the connection and quit
 			pconn.Close()
-			return nil
+			return errClosing
 		}
+		log.Println("incoming connection:", pconn)
+		peer := &Peer{
+			Conn:    pconn,
+			Session: sess,
+
+			// OPT tweak buffers
+			msgs:             make(chan Message, 256),
+			incomingRequests: make(chan Request, 256),
+			writes:           make(chan Message, 256),
+			controlWrites:    make(chan Message, 256),
+			done:             make(chan struct{}),
+
+			Have:           NewBitset(),
+			amInterested:   false,
+			amChoking:      true,
+			peerInterested: false,
+			peerChoking:    true,
+		}
+		sess.Peers[peer] = struct{}{}
+
+		sess.peersWg.Add(1)
+		sess.mu.Unlock()
+		go func() {
+			defer sess.peersWg.Done()
+			err := sess.runPeer(peer)
+			log.Printf("peer failed: %s", err)
+
+			sess.mu.Lock()
+			defer sess.mu.Unlock()
+			// XXX update per-torrent lists of peers
+			delete(sess.Peers, peer)
+		}()
 	}
 }
 
@@ -713,11 +735,16 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	for _, torr := range sess.Torrents {
 		torr.Stop(ctx)
 	}
+	for peer := range sess.Peers {
+		peer.Conn.Close()
+	}
 	sess.mu.Unlock()
 
 	// XXX allow ctx to cancel waiting
 	// sess.torrentsWg.Wait()
 	// log.Println("All torrents done")
+
+	// XXX wait for torr.Stop to actually have done its job
 
 	sess.peersWg.Wait()
 	log.Println("All peers done")
@@ -725,56 +752,7 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 }
 
 func (sess *Session) Run() error {
-	errs := make(chan error, 1)
-	go func() { errs <- sess.listen() }()
-
-	for {
-		select {
-		case err := <-errs:
-			return err
-		case pconn := <-sess.incomingConnections:
-			log.Println("incoming connection:", pconn)
-			peer := &Peer{
-				Conn:    pconn,
-				Session: sess,
-
-				// OPT tweak buffers
-				msgs:             make(chan Message, 256),
-				incomingRequests: make(chan Request, 256),
-				writes:           make(chan Message, 256),
-				controlWrites:    make(chan Message, 256),
-				done:             make(chan struct{}),
-
-				Have:           NewBitset(),
-				amInterested:   false,
-				amChoking:      true,
-				peerInterested: false,
-				peerChoking:    true,
-			}
-			sess.Peers[peer] = struct{}{}
-
-			sess.peersWg.Add(1)
-			go func() {
-				defer sess.peersWg.Done()
-				err := sess.runPeer(peer)
-				log.Printf("peer failed: %s", err)
-
-				select {
-				case sess.closedConnections <- peer:
-				case <-sess.closing:
-					// we're shutting down, so it's fine to drop this event on the floor
-				}
-			}()
-		case peer := <-sess.closedConnections:
-			// XXX update per-torrent lists of peers
-			delete(sess.Peers, peer)
-		case <-sess.closing:
-			for peer := range sess.Peers {
-				peer.Conn.Close()
-			}
-			return errClosing
-		}
-	}
+	return sess.listen()
 }
 
 type Message struct {
@@ -823,15 +801,16 @@ func (torr *Torrent) Start() {
 	}
 
 	// XXX initialize new stats for this "session" (delimieted by a start and stop announce)
-	// XXX send announce
+	// XXX allow interrupting the announce
+	torr.session.announce(context.Background(), torr, "started")
 }
 
 func (torr *Torrent) Stop(ctx context.Context) {
-	panic("XXX: we cannot stop torrents yet")
-
 	if torr.Action != nil {
 		torr.Action.Stop()
 	} else {
+		// XXX implement
+
 		// updateState()
 		// killOurPeers()
 	}
