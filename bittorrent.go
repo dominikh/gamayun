@@ -63,7 +63,33 @@ type Statistics struct {
 }
 
 type Session struct {
-	Settings Settings
+	Settings  Settings
+	Callbacks struct {
+		// If set, PeerIncoming gets called when a new incoming connection is being made.
+		// If it returns false, the connection will be rejected.
+		//
+		// Rejected connections will not trigger PeerDisconnected.
+		PeerIncoming func(pconn *protocol.Connection) (allow bool)
+
+		// If set, PeerHandshakeInfoHash gets called after receiving a peer's info hash in the handshake.
+		// If it returns false, the connection will be rejected.
+		//
+		// The function will get called even if the info hash doesn't match any of our torrents or if the torrent is stopped.
+		//
+		// Rejected connections will trigger PeerDisconnected.
+		PeerHandshakeInfoHash func(peer *Peer, hash protocol.InfoHash) (allow bool)
+
+		// If set, PeerHandshakePeerID gets called after receiving a peer's peer ID in the handshake.
+		// If it returns false, the connection will be rejected.
+		//
+		// Note that by the time we read the peer ID, we'll already have sent our own handshake.
+		//
+		// Rejected connections will trigger PeerDisconnected.
+		PeerHandshakePeerID func(peer *Peer, peerID [20]byte) (allow bool)
+
+		// If set, PeerDisconnected gets called after a peer connection has been closed.
+		PeerDisconnected func(peer *Peer, err error)
+	}
 
 	PeerID [20]byte
 
@@ -278,6 +304,7 @@ func (sess *Session) listen() error {
 	if err != nil {
 		return err
 	}
+	defer l.Close()
 
 	sess.mu.Lock()
 	if _, ok := channel.TryRecv(sess.closing); ok {
@@ -288,49 +315,64 @@ func (sess *Session) listen() error {
 	sess.mu.Unlock()
 
 	for {
-		conn, err := l.Accept()
-		if err != nil {
-			return err
-		}
-		pconn := protocol.NewConnection(conn)
-
-		sess.mu.Lock()
-		if _, ok := channel.TryRecv(sess.closing); ok {
-			// We're shutting down, discard the connection and quit
-			pconn.Close()
-			return ErrClosing
-		}
-		log.Println("incoming connection:", pconn)
-		peer := &Peer{
-			conn:    pconn,
-			session: sess,
-
-			// OPT tweak buffers
-			msgs:             make(chan protocol.Message, 256),
-			incomingRequests: make(chan request, 256),
-			writes:           make(chan protocol.Message, 256),
-			controlWrites:    make(chan protocol.Message, 256),
-			done:             make(chan struct{}),
-
-			have:           NewBitset(),
-			amInterested:   false,
-			amChoking:      true,
-			peerInterested: false,
-			peerChoking:    true,
-		}
-		sess.peers.Add(peer)
-
-		sess.peersWg.Add(1)
-		sess.mu.Unlock()
-		go func() {
-			defer sess.peersWg.Done()
-			err := sess.runPeer(peer)
-			log.Printf("peer failed: %s", err)
+		err := func() error {
+			conn, err := l.Accept()
+			if err != nil {
+				return err
+			}
+			pconn := protocol.NewConnection(conn)
+			if sess.Callbacks.PeerIncoming != nil {
+				if !sess.Callbacks.PeerIncoming(pconn) {
+					pconn.Close()
+					return nil
+				}
+			}
 
 			sess.mu.Lock()
 			defer sess.mu.Unlock()
-			sess.peers.Delete(peer)
+			if _, ok := channel.TryRecv(sess.closing); ok {
+				// We're shutting down, discard the connection and quit
+				pconn.Close()
+				return ErrClosing
+			}
+
+			peer := &Peer{
+				conn:    pconn,
+				session: sess,
+
+				// OPT tweak buffers
+				msgs:             make(chan protocol.Message, 256),
+				incomingRequests: make(chan request, 256),
+				writes:           make(chan protocol.Message, 256),
+				controlWrites:    make(chan protocol.Message, 256),
+				done:             make(chan struct{}),
+
+				have:           NewBitset(),
+				amInterested:   false,
+				amChoking:      true,
+				peerInterested: false,
+				peerChoking:    true,
+			}
+			sess.peers.Add(peer)
+
+			sess.peersWg.Add(1)
+			go func() {
+				defer sess.peersWg.Done()
+				err := sess.runPeer(peer)
+
+				sess.mu.Lock()
+				defer sess.mu.Unlock()
+				sess.peers.Delete(peer)
+				if sess.Callbacks.PeerDisconnected != nil {
+					sess.Callbacks.PeerDisconnected(peer, err)
+				}
+			}()
+
+			return nil
 		}()
+		if err != nil {
+			return err
+		}
 	}
 }
 
@@ -459,6 +501,22 @@ func (err WriteError) Unwrap() error {
 	return err.error
 }
 
+type CallbackRejectedInfoHashError struct {
+	Hash protocol.InfoHash
+}
+
+func (err CallbackRejectedInfoHashError) Error() string {
+	return fmt.Sprintf("peer wasn't allowed to connect to torrent %s", err.Hash)
+}
+
+type CallbackRejectedPeerIDError struct {
+	PeerID [20]byte
+}
+
+func (err CallbackRejectedPeerIDError) Error() string {
+	return fmt.Sprintf("peer wasn't allowed to connect with peer ID %q", err.PeerID)
+}
+
 func (sess *Session) runPeer(peer *Peer) error {
 	defer func() {
 		close(peer.done)
@@ -470,7 +528,13 @@ func (sess *Session) runPeer(peer *Peer) error {
 	if err != nil {
 		return err
 	}
-	log.Println("got handshake from", peer)
+
+	if sess.Callbacks.PeerHandshakeInfoHash != nil {
+		if !sess.Callbacks.PeerHandshakeInfoHash(peer, hash) {
+			return CallbackRejectedInfoHashError{hash}
+		}
+	}
+
 	sess.mu.RLock()
 	torr, ok := sess.torrents[hash]
 	sess.mu.RUnlock()
@@ -506,8 +570,12 @@ func (sess *Session) runPeer(peer *Peer) error {
 	if err != nil {
 		return err
 	}
-	log.Println("got peer ID from", peer)
 	peer.peerID = id
+	if sess.Callbacks.PeerHandshakePeerID != nil {
+		if !sess.Callbacks.PeerHandshakePeerID(peer, id) {
+			return CallbackRejectedPeerIDError{id}
+		}
+	}
 
 	errs := make(chan error, 1)
 	// OPT multiple reader goroutines?

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent"
+	"honnef.co/go/bittorrent/protocol"
 )
 
 func main() {
@@ -17,6 +18,21 @@ func main() {
 	// }()
 
 	client := bittorrent.NewSession()
+	client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
+		log.Println("New peer:", pconn)
+		return true
+	}
+	client.Callbacks.PeerDisconnected = func(peer *bittorrent.Peer, err error) {
+		log.Println("Peer disconnected:", peer, err)
+	}
+	client.Callbacks.PeerHandshakeInfoHash = func(peer *bittorrent.Peer, h protocol.InfoHash) bool {
+		log.Printf("Peer %s wants to connect to torrent %s", peer, h)
+		return true
+	}
+	client.Callbacks.PeerHandshakePeerID = func(peer *bittorrent.Peer, id [20]byte) bool {
+		log.Printf("Peer %s wants to connect with peer ID %q", peer, id)
+		return true
+	}
 
 	go func() {
 		err := client.Run()
