@@ -717,57 +717,6 @@ func (sess *Session) runPeer(peer *Peer) error {
 	}
 }
 
-/*
-func (sess *Session) runTorrent(torr *Torrent) error {
-	torr.State = TorrentStateVerifying
-	torr.NextState = TorrentStateStopped
-
-	// XXX don't verify when calling runTorrent, instead make it a possible action on the torrent
-	// XXX disabled for debugging
-	if false {
-		t := time.Now()
-		bits, err := verifyTorrent(torr)
-		if err != nil {
-			// XXX handle
-			panic(err)
-		}
-		d := time.Since(t)
-
-		// XXX support multi file mode
-		rate := float64(torr.Metainfo.Info.Length) / float64(d)
-		log.Printf("verified %s at %.2f MB/s: %.2f%%", torr.Hash, rate*1000, float64(bits.count)/float64(torr.NumPieces())*100)
-
-		torr.Have = bits
-	} else {
-		bits := NewBitset()
-		for i := 0; i < torr.NumPieces(); i++ {
-			bits.Set(uint32(i))
-		}
-		torr.Have = bits
-	}
-
-	log.Printf("transitioning %s from state %s to %s", torr.Hash, torr.State, torr.NextState)
-	torr.State = torr.NextState
-	torr.NextState = TorrentStateStopped
-
-	// XXX torrent should default to being stopped, getting started by an action
-	//
-
-	// OPT(dh): disable ticker if we have no peers. there's no point in waking up thousands of torrents every second just to do nothing.
-	ticker := time.NewTicker(time.Second)
-	for {
-		select {
-		case <-ticker.C:
-			// XXX
-		case <-sess.closing:
-			// XXX respect Shutdown timing out, handle announce failing and retry
-			sess.announce(context.TODO(), torr, "stopped")
-			return errClosing
-		}
-	}
-}
-*/
-
 func (sess *Session) Shutdown(ctx context.Context) error {
 	// XXX close all the files in all the torrents. although, once we
 	// have lazy file opening, this should happen in Torrent.Stop
@@ -803,6 +752,8 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 
 func (sess *Session) Run() error {
 	return sess.listen()
+
+	// XXX periodically announce torrents, choke/unchoke peers, ...
 }
 
 type Message struct {
@@ -1198,25 +1149,6 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 
 	return res, false, nil
 }
-
-// 	announcer := time.NewTicker(30 * time.Minute) // XXX use actual announce interval
-// 	defer announcer.Stop()
-//
-// 	for {
-// 		case <-announcer.C:
-// 			// TODO(dh): we probably shouldn't block trying to send the announce. especially not if we're shutting down
-// 			// XXX global rate limit of announces
-// 			tresp, err := sess.announce(context.TODO(), torr, "")
-// 			if err != nil {
-// 				// TODO(dh): try to announce again soon, don't wait for the next planned announc
-// 				log.Printf("failed announcing %s to %s: %s", torr.Hash, torr.Metainfo.Announce, err)
-// 				continue
-// 			}
-// 			// XXX do something with the response
-// 			goon.Dump(tresp)
-// 		}
-// 	}
-// }
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 	// XXX Stop is asynchronous, make it synchronous and wait
