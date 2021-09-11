@@ -75,7 +75,7 @@ type Session struct {
 	closing  chan struct{}
 	mu       sync.RWMutex
 	listener net.Listener
-	Torrents map[protocol.InfoHash]*Torrent
+	torrents map[protocol.InfoHash]*Torrent
 	peers    container.Set[*Peer]
 }
 
@@ -88,7 +88,7 @@ func (sess *Session) Statistics() Statistics {
 	}
 }
 
-type Request struct {
+type request struct {
 	Index  uint32
 	Begin  uint32
 	Length uint32
@@ -111,7 +111,7 @@ func NewSession() *Session {
 		// XXX generate peer ID
 		PeerID:   [20]byte{123, 123, 126, 36, 123, 42, 122},
 		Settings: DefaultSettings,
-		Torrents: map[protocol.InfoHash]*Torrent{},
+		torrents: map[protocol.InfoHash]*Torrent{},
 		peers:    container.NewSet[*Peer](),
 		closing:  make(chan struct{}),
 	}
@@ -169,7 +169,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
-		Have:     NewBitset(),
+		have:     NewBitset(),
 		session:  sess,
 		peers:    container.NewSet[*Peer](),
 	}
@@ -181,35 +181,35 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	var files dataStorage
 	if len(info.Info.Files) == 0 {
 		// single-file mode
-		files.Add(info.Info.Name, info.Info.Length)
+		files.add(info.Info.Name, info.Info.Length)
 	} else {
 		// multi-file mode
 		for _, fe := range info.Info.Files {
 			// XXX prevent directory traversal
-			files.Add(filepath.Join(info.Info.Name, filepath.Join(fe.Path...)), fe.Length)
+			files.add(filepath.Join(info.Info.Name, filepath.Join(fe.Path...)), fe.Length)
 		}
 	}
 	torr.data = &files
 
 	n := uint32(torr.NumPieces())
-	torr.Availability = Pieces{
+	torr.availability = Pieces{
 		pieceIndices: make([]uint32, n),
-		SortedPieces: make([]uint32, n),
-		Priorities:   make([]uint16, n),
+		sortedPieces: make([]uint32, n),
+		priorities:   make([]uint16, n),
 		buckets:      []uint32{n},
 	}
 	for i := uint32(0); i < n; i++ {
-		torr.Availability.pieceIndices[i] = i
-		torr.Availability.SortedPieces[i] = i
+		torr.availability.pieceIndices[i] = i
+		torr.availability.sortedPieces[i] = i
 	}
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if _, ok := channel.TryRecv(sess.closing); ok {
 		// Don't add new torrent to an already stopped client
-		return nil, errClosing
+		return nil, ErrClosing
 	}
-	sess.Torrents[torr.Hash] = torr
+	sess.torrents[torr.Hash] = torr
 
 	return torr, nil
 }
@@ -269,7 +269,7 @@ func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) 
 	return &tresp, nil
 }
 
-var errClosing = errors.New("client is shutting down")
+var ErrClosing = errors.New("client is shutting down")
 
 func (sess *Session) listen() error {
 	defer log.Println("listener goroutine has quit")
@@ -282,7 +282,7 @@ func (sess *Session) listen() error {
 	sess.mu.Lock()
 	if _, ok := channel.TryRecv(sess.closing); ok {
 		l.Close()
-		return errClosing
+		return ErrClosing
 	}
 	sess.listener = l
 	sess.mu.Unlock()
@@ -298,21 +298,21 @@ func (sess *Session) listen() error {
 		if _, ok := channel.TryRecv(sess.closing); ok {
 			// We're shutting down, discard the connection and quit
 			pconn.Close()
-			return errClosing
+			return ErrClosing
 		}
 		log.Println("incoming connection:", pconn)
 		peer := &Peer{
-			Conn:    pconn,
-			Session: sess,
+			conn:    pconn,
+			session: sess,
 
 			// OPT tweak buffers
-			msgs:             make(chan Message, 256),
-			incomingRequests: make(chan Request, 256),
-			writes:           make(chan Message, 256),
-			controlWrites:    make(chan Message, 256),
+			msgs:             make(chan protocol.Message, 256),
+			incomingRequests: make(chan request, 256),
+			writes:           make(chan protocol.Message, 256),
+			controlWrites:    make(chan protocol.Message, 256),
 			done:             make(chan struct{}),
 
-			Have:           NewBitset(),
+			have:           NewBitset(),
 			amInterested:   false,
 			amChoking:      true,
 			peerInterested: false,
@@ -334,35 +334,25 @@ func (sess *Session) listen() error {
 	}
 }
 
-type HandshakeMessage struct {
-	Peer *Peer
-	Hash protocol.InfoHash
-}
-
-type PeerIDMessage struct {
-	Peer   *Peer
-	PeerID [20]byte
-}
-
-func (peer *Peer) write(msg Message) error {
+func (peer *Peer) write(msg protocol.Message) error {
 	select {
 	case peer.writes <- msg:
 		return nil
 	case <-peer.done:
 		return nil
-	case <-peer.Session.closing:
-		return errClosing
+	case <-peer.session.closing:
+		return ErrClosing
 	}
 }
 
-func (peer *Peer) controlWrite(msg Message) error {
+func (peer *Peer) controlWrite(msg protocol.Message) error {
 	select {
 	case peer.controlWrites <- msg:
 		return nil
 	case <-peer.done:
 		return nil
-	case <-peer.Session.closing:
-		return errClosing
+	case <-peer.session.closing:
+		return ErrClosing
 	}
 }
 
@@ -376,21 +366,19 @@ func (peer *Peer) blockReader() error {
 				// XXX make sure req.Length isn't too long
 				// OPT reuse buffers
 				buf := make([]byte, req.Length)
-				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
+				_, err := peer.torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
 				if err != nil {
 					return err
 				}
 
 				// XXX track upload stat
 
-				return peer.write(Message{
-					Message: protocol.Message{
-						Type:   protocol.MessageTypePiece,
-						Index:  req.Index,
-						Begin:  req.Begin,
-						Length: req.Length,
-						Data:   buf,
-					},
+				return peer.write(protocol.Message{
+					Type:   protocol.MessageTypePiece,
+					Index:  req.Index,
+					Begin:  req.Begin,
+					Length: req.Length,
+					Data:   buf,
 				})
 			}()
 			if err != nil {
@@ -404,15 +392,13 @@ func (peer *Peer) blockReader() error {
 
 func (peer *Peer) readPeer() error {
 	for {
-		msg, err := peer.Conn.ReadMessage()
+		msg, err := peer.conn.ReadMessage()
 		if err != nil {
 			return err
 		}
-		atomic.AddUint64(&peer.Session.statistics.DownloadedTotal, uint64(msg.Size()))
+		atomic.AddUint64(&peer.session.statistics.DownloadedTotal, uint64(msg.Size()))
 		select {
-		case peer.msgs <- Message{
-			Message: msg,
-		}:
+		case peer.msgs <- msg:
 		case <-peer.done:
 			return nil
 		}
@@ -420,9 +406,9 @@ func (peer *Peer) readPeer() error {
 }
 
 func (peer *Peer) writePeer() error {
-	writeMsg := func(msg Message) error {
-		atomic.AddUint64(&peer.Session.statistics.UploadedTotal, uint64(msg.Size()))
-		return peer.Conn.WriteMessage(msg.Message)
+	writeMsg := func(msg protocol.Message) error {
+		atomic.AddUint64(&peer.session.statistics.UploadedTotal, uint64(msg.Size()))
+		return peer.conn.WriteMessage(msg)
 	}
 
 	for {
@@ -476,17 +462,17 @@ func (err WriteError) Unwrap() error {
 func (sess *Session) runPeer(peer *Peer) error {
 	defer func() {
 		close(peer.done)
-		peer.Conn.Close()
+		peer.conn.Close()
 	}()
 
 	// XXX add handshake and peer id to DownloadedTotal stat
-	hash, err := peer.Conn.ReadHandshake()
+	hash, err := peer.conn.ReadHandshake()
 	if err != nil {
 		return err
 	}
 	log.Println("got handshake from", peer)
 	sess.mu.RLock()
-	torr, ok := sess.Torrents[hash]
+	torr, ok := sess.torrents[hash]
 	sess.mu.RUnlock()
 	if !ok {
 		return UnknownTorrentError{hash}
@@ -495,9 +481,9 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// XXX once we support removing torrents, this will race
 
 	torr.mu.Lock()
-	if torr.State == TorrentStateStopped {
+	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
-		peer.Conn.Close()
+		peer.conn.Close()
 		torr.mu.Unlock()
 		return StoppedTorrentError{hash}
 	}
@@ -510,18 +496,18 @@ func (sess *Session) runPeer(peer *Peer) error {
 		torr.peers.Delete(peer)
 	}()
 
-	peer.Torrent = torr
+	peer.torrent = torr
 
-	if err := peer.Conn.SendHandshake(hash, sess.PeerID); err != nil {
+	if err := peer.conn.SendHandshake(hash, sess.PeerID); err != nil {
 		return WriteError{err}
 	}
 
-	id, err := peer.Conn.ReadPeerID()
+	id, err := peer.conn.ReadPeerID()
 	if err != nil {
 		return err
 	}
 	log.Println("got peer ID from", peer)
-	peer.PeerID = id
+	peer.peerID = id
 
 	errs := make(chan error, 1)
 	// OPT multiple reader goroutines?
@@ -536,23 +522,19 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// sent ours, now tell the peer which pieces we have
 	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
 	torr.mu.RLock()
-	have := torr.Have.Copy()
+	have := torr.have.Copy()
 	torr.mu.RUnlock()
 	peer.lastHaveSent = have
 	if have.count == 0 {
-		err := peer.write(Message{
-			Message: protocol.Message{
-				Type: protocol.MessageTypeHaveNone,
-			},
+		err := peer.write(protocol.Message{
+			Type: protocol.MessageTypeHaveNone,
 		})
 		if err != nil {
 			return err
 		}
 	} else if have.count == torr.NumPieces() {
-		err := peer.write(Message{
-			Message: protocol.Message{
-				Type: protocol.MessageTypeHaveAll,
-			},
+		err := peer.write(protocol.Message{
+			Type: protocol.MessageTypeHaveAll,
 		})
 		if err != nil {
 			return err
@@ -561,11 +543,9 @@ func (sess *Session) runPeer(peer *Peer) error {
 		// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
 		for i := 0; i < torr.NumPieces(); i++ {
 			if have.bits.Bit(i) != 0 {
-				err := peer.write(Message{
-					Message: protocol.Message{
-						Type:  protocol.MessageTypeHave,
-						Index: uint32(i),
-					},
+				err := peer.write(protocol.Message{
+					Type:  protocol.MessageTypeHave,
+					Index: uint32(i),
 				})
 				if err != nil {
 					return err
@@ -586,10 +566,8 @@ func (sess *Session) runPeer(peer *Peer) error {
 		case <-t.C:
 			if !peer.peerInterested && !peer.amChoking {
 				peer.amChoking = true
-				err := peer.controlWrite(Message{
-					Message: protocol.Message{
-						Type: protocol.MessageTypeChoke,
-					},
+				err := peer.controlWrite(protocol.Message{
+					Type: protocol.MessageTypeChoke,
 				})
 				if err != nil {
 					return err
@@ -597,20 +575,18 @@ func (sess *Session) runPeer(peer *Peer) error {
 			} else if peer.peerInterested && peer.amChoking {
 				// XXX limit number of unchoked peers
 				peer.amChoking = false
-				err := peer.controlWrite(Message{
-					Message: protocol.Message{
-						Type: protocol.MessageTypeUnchoke,
-					},
+				err := peer.controlWrite(protocol.Message{
+					Type: protocol.MessageTypeUnchoke,
 				})
 				if err != nil {
 					return err
 				}
 			}
 
-			torr := peer.Torrent
+			torr := peer.torrent
 			torr.mu.RLock()
-			if torr.Have.count != peer.lastHaveSent.count {
-				have := torr.Have.Copy()
+			if torr.have.count != peer.lastHaveSent.count {
+				have := torr.have.Copy()
 				torr.mu.RUnlock()
 
 				// XXX find diff between lastHaveSent and have, send Have messages
@@ -625,13 +601,13 @@ func (sess *Session) runPeer(peer *Peer) error {
 				case protocol.MessageTypeBitfield:
 					t := time.Now()
 					// XXX verify length and shape of bitfield
-					peer.Have.SetBitfield(msg.Data)
+					peer.have.SetBitfield(msg.Data)
 					bit := 0
 					for _, b := range msg.Data {
 						for n := 7; n >= 0; n-- {
 							bit++
 							if b&1<<n != 0 {
-								peer.Torrent.Availability.Inc(uint32(bit))
+								peer.torrent.availability.inc(uint32(bit))
 							}
 						}
 					}
@@ -641,11 +617,11 @@ func (sess *Session) runPeer(peer *Peer) error {
 					// nothing to do
 				case protocol.MessageTypeHaveAll:
 					// OPT more efficient representation for HaveAll
-					for i := 0; i < peer.Torrent.NumPieces(); i++ {
-						peer.Have.Set(uint32(i))
+					for i := 0; i < peer.torrent.NumPieces(); i++ {
+						peer.have.Set(uint32(i))
 					}
 					// XXX decrement when peer disconnects
-					peer.Torrent.Availability.HaveAll++
+					peer.torrent.availability.haveAll++
 				default:
 					// XXX instead of panicing we should kill the peer for a protocol violation
 					panic(fmt.Sprintf("unexpected message %s", msg))
@@ -658,31 +634,27 @@ func (sess *Session) runPeer(peer *Peer) error {
 					// XXX verify that index, begin and length are in bounds
 					// XXX reject if we don't have the piece
 					if peer.amChoking {
-						err := peer.controlWrite(Message{
-							Message: protocol.Message{
-								Type:   protocol.MessageTypeRejectRequest,
-								Index:  msg.Index,
-								Begin:  msg.Begin,
-								Length: msg.Length,
-							},
+						err := peer.controlWrite(protocol.Message{
+							Type:   protocol.MessageTypeRejectRequest,
+							Index:  msg.Index,
+							Begin:  msg.Begin,
+							Length: msg.Length,
 						})
 						if err != nil {
 							return err
 						}
 					} else {
-						req := Request{
+						req := request{
 							Index:  msg.Index,
 							Begin:  msg.Begin,
 							Length: msg.Length,
 						}
 						if !channel.TrySend(peer.incomingRequests, req) {
-							err := peer.controlWrite(Message{
-								Message: protocol.Message{
-									Type:   protocol.MessageTypeRejectRequest,
-									Index:  msg.Index,
-									Begin:  msg.Begin,
-									Length: msg.Length,
-								},
+							err := peer.controlWrite(protocol.Message{
+								Type:   protocol.MessageTypeRejectRequest,
+								Index:  msg.Index,
+								Begin:  msg.Begin,
+								Length: msg.Length,
 							})
 							if err != nil {
 								return err
@@ -696,9 +668,9 @@ func (sess *Session) runPeer(peer *Peer) error {
 				case protocol.MessageTypeHave:
 					// XXX check bounds
 					// XXX ignore Have if we've gotten HaveAll before
-					peer.Have.Set(msg.Index)
+					peer.have.Set(msg.Index)
 					// XXX decrement when peer disconnects
-					peer.Torrent.Availability.Inc(msg.Index)
+					peer.torrent.availability.inc(msg.Index)
 				case protocol.MessageTypeChoke:
 					// XXX handle
 					peer.peerChoking = true
@@ -735,11 +707,11 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 		sess.listener.Close()
 	}
 
-	for _, torr := range sess.Torrents {
+	for _, torr := range sess.torrents {
 		torr.Stop(ctx)
 	}
 	for peer := range sess.peers {
-		peer.Conn.Close()
+		peer.conn.Close()
 	}
 	sess.mu.Unlock()
 
@@ -760,10 +732,6 @@ func (sess *Session) Run() error {
 	// XXX periodically announce torrents, choke/unchoke peers, ...
 }
 
-type Message struct {
-	protocol.Message
-}
-
 //go:generate go run golang.org/x/tools/cmd/stringer@master -type TorrentState
 type TorrentState uint8
 
@@ -776,35 +744,35 @@ const (
 type Torrent struct {
 	Metainfo     *Metainfo
 	Hash         protocol.InfoHash
-	Availability Pieces
+	availability Pieces
 
 	data *dataStorage
 
-	Action Action
+	action Action
 
 	session *Session
 
 	mu sync.RWMutex
 	// Pieces we have
-	Have  Bitset
-	State TorrentState
+	have  Bitset
+	state TorrentState
 	peers container.Set[*Peer]
 }
 
 func (torr *Torrent) Start() {
-	if torr.State != TorrentStateStopped {
+	if torr.state != TorrentStateStopped {
 		return
 	}
 
-	if torr.Action != nil {
+	if torr.action != nil {
 		return
 	}
 
 	torr.mu.Lock()
 	if torr.IsComplete() {
-		torr.State = TorrentStateSeeding
+		torr.state = TorrentStateSeeding
 	} else {
-		torr.State = TorrentStateLeeching
+		torr.state = TorrentStateLeeching
 		panic("XXX: we cannot download torrents yet")
 	}
 	torr.mu.Unlock()
@@ -819,15 +787,15 @@ func (torr *Torrent) Start() {
 }
 
 func (torr *Torrent) Stop(ctx context.Context) {
-	if torr.Action != nil {
-		torr.Action.Stop()
+	if torr.action != nil {
+		torr.action.Stop()
 	} else {
 		// XXX how should this handle an in-progress announce?
 
 		torr.mu.Lock()
 		defer torr.mu.Unlock()
-		if torr.State != TorrentStateStopped {
-			torr.State = TorrentStateStopped
+		if torr.state != TorrentStateStopped {
+			torr.state = TorrentStateStopped
 
 			for peer := range torr.peers {
 				// Right now this won't deadlock. runPeer runs in its
@@ -836,7 +804,7 @@ func (torr *Torrent) Stop(ctx context.Context) {
 				// Stop to return first. However, if we were to wait
 				// for runPeer to return before returning from Stop,
 				// we'd have a deadlock.
-				peer.Conn.Close()
+				peer.conn.Close()
 
 			}
 
@@ -850,11 +818,12 @@ func (torr *Torrent) String() string {
 }
 
 func (torr *Torrent) IsComplete() bool {
-	return torr.Have.count == torr.NumPieces()
+	// XXX locking
+	return torr.have.count == torr.NumPieces()
 }
 
 func (torr *Torrent) SetHave(have Bitset) {
-	torr.Have = have
+	torr.have = have
 }
 
 func (torr *Torrent) NumPieces() int {
@@ -875,16 +844,16 @@ func (torr *Torrent) NumPieces() int {
 }
 
 type Peer struct {
-	Conn    *protocol.Connection
-	Session *Session
+	conn    *protocol.Connection
+	session *Session
 
 	// incoming
-	msgs             chan Message
-	incomingRequests chan Request
+	msgs             chan protocol.Message
+	incomingRequests chan request
 
 	// outgoing
-	controlWrites chan Message
-	writes        chan Message
+	controlWrites chan protocol.Message
+	writes        chan protocol.Message
 
 	done chan struct{}
 
@@ -894,8 +863,8 @@ type Peer struct {
 
 	// mutable, but doesn't need locking
 	// Pieces the peer has
-	PeerID [20]byte
-	Have   Bitset
+	peerID [20]byte
+	have   Bitset
 	// The peer has sent one of the allowed initial messages
 	setup          bool
 	amChoking      bool
@@ -903,7 +872,7 @@ type Peer struct {
 	peerChoking    bool
 	peerInterested bool
 	lastHaveSent   Bitset
-	Torrent        *Torrent
+	torrent        *Torrent
 
 	// mutable, needs lock held
 
@@ -912,16 +881,12 @@ type Peer struct {
 }
 
 func (peer *Peer) String() string {
-	return peer.Conn.String()
+	return peer.conn.String()
 }
 
 type Error struct {
 	Error error
 	Peer  *Peer
-}
-
-func NewBitset() Bitset {
-	return Bitset{bits: big.NewInt(0)}
 }
 
 type Bitset struct {
@@ -930,6 +895,10 @@ type Bitset struct {
 	// the wire protocol, so that we don't have to convert between the
 	// two all the time
 	bits *big.Int
+}
+
+func NewBitset() Bitset {
+	return Bitset{bits: big.NewInt(0)}
 }
 
 func (set Bitset) Copy() Bitset {
@@ -1016,39 +985,39 @@ type Pieces struct {
 	pieceIndices []uint32
 
 	// sorted list of pieces, indexed into by piece_indices
-	SortedPieces []uint32
+	sortedPieces []uint32
 
 	// mapping from piece to priority
-	Priorities []uint16 // supports at most 65536 peers
+	priorities []uint16 // supports at most 65536 peers
 
 	// mapping from priority to one past the last item in sorted_pieces that is part of that priority
 	buckets []uint32
 
 	// Mapping from piece to status
-	Downloading big.Int // OPT don't use big.Int, it wastes a byte (+padding) on the sign
+	downloading big.Int // OPT don't use big.Int, it wastes a byte (+padding) on the sign
 
 	// Mapping from piece to block bitmap
-	BlockBitmapPtrs []uint16 // supports at most 65536 actively downloading pieces
+	blockBitmapPtrs []uint16 // supports at most 65536 actively downloading pieces
 	// Mapping from block bitmap pointer to block bitmap
-	BlockBitmaps []*big.Int
+	blockBitmaps []*big.Int
 
 	// Number of peers that have all pieces. These aren't tracked in Priorities.
-	HaveAll int
+	haveAll int
 }
 
-func (t *Pieces) Inc(piece uint32) {
+func (t *Pieces) inc(piece uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	avail := t.Priorities[piece]
+	avail := t.priorities[piece]
 	t.buckets[avail]--
-	t.Priorities[piece]++
+	t.priorities[piece]++
 
 	index := t.pieceIndices[piece]
 	other_index := t.buckets[avail]
-	other_piece := t.SortedPieces[other_index]
+	other_piece := t.sortedPieces[other_index]
 
-	t.SortedPieces[other_index], t.SortedPieces[index] = t.SortedPieces[index], t.SortedPieces[other_index]
+	t.sortedPieces[other_index], t.sortedPieces[index] = t.sortedPieces[index], t.sortedPieces[other_index]
 	t.pieceIndices[other_piece], t.pieceIndices[piece] = t.pieceIndices[piece], t.pieceIndices[other_piece]
 
 	if uint32(avail+1) >= uint32(len(t.buckets)) {
@@ -1056,21 +1025,21 @@ func (t *Pieces) Inc(piece uint32) {
 	}
 }
 
-func (t *Pieces) Dec(piece uint32) {
+func (t *Pieces) dec(piece uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.Priorities[piece]--
-	avail := t.Priorities[piece]
+	t.priorities[piece]--
+	avail := t.priorities[piece]
 
 	index := t.pieceIndices[piece]
 	other_index := t.buckets[avail]
-	other_piece := t.SortedPieces[other_index]
+	other_piece := t.sortedPieces[other_index]
 	t.buckets[avail]++
 
 	log.Println(other_index)
 
-	t.SortedPieces[other_index], t.SortedPieces[index] = t.SortedPieces[index], t.SortedPieces[other_index]
+	t.sortedPieces[other_index], t.sortedPieces[index] = t.sortedPieces[index], t.sortedPieces[other_index]
 	t.pieceIndices[other_piece], t.pieceIndices[piece] = t.pieceIndices[piece], t.pieceIndices[other_piece]
 }
 
@@ -1080,34 +1049,34 @@ type Action interface {
 	Stop()
 }
 
-type action struct {
-	torr    *Torrent
-	pause   chan struct{}
-	stop    chan struct{}
-	unpause chan struct{}
+type BaseAction struct {
+	Torrent   *Torrent
+	PauseCh   chan struct{}
+	StopCh    chan struct{}
+	UnpauseCh chan struct{}
 }
 
-func (l *action) Pause()   { channel.TrySend(l.pause, struct{}{}) }
-func (l *action) Unpause() { channel.TrySend(l.unpause, struct{}{}) }
-func (l *action) Stop()    { channel.TrySend(l.stop, struct{}{}) }
+func (l *BaseAction) Pause()   { channel.TrySend(l.PauseCh, struct{}{}) }
+func (l *BaseAction) Unpause() { channel.TrySend(l.UnpauseCh, struct{}{}) }
+func (l *BaseAction) Stop()    { channel.TrySend(l.StopCh, struct{}{}) }
 
 type Verify struct {
-	action
+	BaseAction
 }
 
 func (l *Verify) Run() (result interface{}, stopped bool, err error) {
-	log.Println("started verifying", l.torr)
+	log.Println("started verifying", l.Torrent)
 	defer func() {
 		if stopped {
-			log.Println("stopped verifying", l.torr)
+			log.Println("stopped verifying", l.Torrent)
 		} else {
-			log.Println("finished verifying", l.torr)
+			log.Println("finished verifying", l.Torrent)
 		}
 	}()
 
 	// OPT use more than one goroutine to verify in parallel; we get about 1 GB/s on one core
-	pieceSize := l.torr.Metainfo.Info.PieceLength
-	numPieces := l.torr.NumPieces()
+	pieceSize := l.Torrent.Metainfo.Info.PieceLength
+	numPieces := l.Torrent.NumPieces()
 
 	res := NewBitset()
 
@@ -1120,14 +1089,14 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 
 	for {
 		select {
-		case <-l.pause:
-			<-l.unpause
-		case <-l.stop:
+		case <-l.PauseCh:
+			<-l.UnpauseCh
+		case <-l.StopCh:
 			return res, true, nil
 		default:
 		}
 
-		n, err := l.torr.data.ReadAt(buf, int64(piece)*int64(pieceSize))
+		n, err := l.Torrent.data.ReadAt(buf, int64(piece)*int64(pieceSize))
 		if err != nil {
 			if err == io.ErrUnexpectedEOF {
 				if piece+1 != uint32(numPieces) {
@@ -1144,7 +1113,7 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 		}
 
 		off := piece * 20
-		if verifyBlock(buf, l.torr.Metainfo.Info.Pieces[off:off+20]) {
+		if verifyBlock(buf, l.Torrent.Metainfo.Info.Pieces[off:off+20]) {
 			res.Set(piece)
 		}
 
@@ -1154,26 +1123,26 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 	return res, false, nil
 }
 
+func NewVerify(torr *Torrent) Action {
+	return &Verify{
+		BaseAction: BaseAction{
+			Torrent:   torr,
+			PauseCh:   make(chan struct{}, 1),
+			StopCh:    make(chan struct{}, 1),
+			UnpauseCh: make(chan struct{}, 1),
+		},
+	}
+}
+
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 	// XXX Stop is asynchronous, make it synchronous and wait
 	// XXX allow timing this out?
 	torr.Stop(context.Background())
-	torr.Action = l
-	res, stopped, err := torr.Action.Run()
-	torr.Action = nil
+	torr.action = l
+	res, stopped, err := torr.action.Run()
+	torr.action = nil
 
 	return res, stopped, err
-}
-
-func NewVerify(torr *Torrent) Action {
-	return &Verify{
-		action: action{
-			torr:    torr,
-			pause:   make(chan struct{}, 1),
-			stop:    make(chan struct{}, 1),
-			unpause: make(chan struct{}, 1),
-		},
-	}
 }
 
 // OPT cache open files
@@ -1188,7 +1157,7 @@ type dataStorageFile struct {
 	Size   int64
 }
 
-func (ds *dataStorage) Add(path string, length int64) {
+func (ds *dataStorage) add(path string, length int64) {
 	ds.files = append(ds.files, dataStorageFile{path, ds.length, length})
 	ds.length += length
 }
