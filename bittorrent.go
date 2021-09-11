@@ -41,6 +41,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,7 +51,6 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 
 	"github.com/zeebo/bencode"
-	"go4.org/readerutil"
 )
 
 type Statistics struct {
@@ -122,7 +122,7 @@ func verifyBlock(data []byte, checksum []byte) bool {
 }
 
 func (sess *Session) validateMetainfo(info *Metainfo) error {
-	var a uint64
+	var a int64
 	if len(info.Info.Files) == 0 {
 		// single-file mode
 		a = info.Info.Length
@@ -176,34 +176,19 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	// XXX ensure the on-disk files are of the right lengths
 
 	// XXX don't require all files in a torrent to always be open. open them lazily.
-	var files []readerutil.SizeReaderAt
-	// io.NewSectionReader(f, 0, int64(info.Info.Length))
+
+	var files dataStorage
 	if len(info.Info.Files) == 0 {
 		// single-file mode
-		f, err := os.Open(info.Info.Name)
-		if err != nil {
-			// XXX don't depend on the file already existing; create it if needed, as a sparse file
-			return nil, err
-		}
-		files = append(files, io.NewSectionReader(f, 0, int64(info.Info.Length)))
+		files.Add(info.Info.Name, info.Info.Length)
 	} else {
 		// multi-file mode
-		var osFiles []*os.File
 		for _, fe := range info.Info.Files {
 			// XXX prevent directory traversal
-			f, err := os.Open(filepath.Join(fe.Path...))
-			if err != nil {
-				for _, f := range osFiles {
-					f.Close()
-				}
-				// XXX don't depend on the file already existing; create it if needed, as a sparse file
-				return nil, err
-			}
-			files = append(files, io.NewSectionReader(f, 0, int64(fe.Length)))
-			osFiles = append(osFiles, f)
+			files.Add(filepath.Join(info.Info.Name, filepath.Join(fe.Path...)), fe.Length)
 		}
 	}
-	torr.data = readerutil.NewMultiReaderAt(files...)
+	torr.data = &files
 
 	n := uint32(torr.NumPieces())
 	torr.Availability = Pieces{
@@ -838,7 +823,7 @@ type Torrent struct {
 	Hash         protocol.InfoHash
 	Availability Pieces
 
-	data io.ReaderAt
+	data *dataStorage
 
 	Action Action
 
@@ -918,7 +903,7 @@ func (torr *Torrent) SetHave(have Bitset) {
 }
 
 func (torr *Torrent) NumPieces() int {
-	var a uint64
+	var a int64
 	if len(torr.Metainfo.Info.Files) == 0 {
 		// single-file mode
 		a = torr.Metainfo.Info.Length
@@ -1253,4 +1238,86 @@ func NewVerify(torr *Torrent) Action {
 			unpause: make(chan struct{}, 1),
 		},
 	}
+}
+
+// OPT cache open files
+type dataStorage struct {
+	files  []dataStorageFile
+	length int64
+}
+
+type dataStorageFile struct {
+	Path   string
+	Offset int64
+	Size   int64
+}
+
+func (ds *dataStorage) Add(path string, length int64) {
+	ds.files = append(ds.files, dataStorageFile{path, ds.length, length})
+	ds.length += length
+}
+
+func (ds *dataStorage) relevantFiles(n int, off int64) []dataStorageFile {
+	// Skip past the requested offset.
+	skipFiles := sort.Search(len(ds.files), func(i int) bool {
+		// This function returns whether Files[i] will
+		// contribute any bytes to our output.
+		file := ds.files[i]
+		return file.Offset+file.Size > off
+	})
+	return ds.files[skipFiles:]
+}
+
+func (ds *dataStorage) ReadAt(p []byte, off int64) (int, error) {
+	wantN := len(p)
+
+	files := ds.relevantFiles(len(p), off)
+	// How far to skip in the first file.
+	needSkip := off
+	if len(files) > 0 {
+		needSkip -= files[0].Offset
+	}
+
+	n := 0
+	for len(files) > 0 && len(p) > 0 {
+		readP := p
+		fileSize := files[0].Size
+		if int64(len(readP)) > fileSize-needSkip {
+			readP = readP[:fileSize-needSkip]
+		}
+
+		f, err := os.Open(files[0].Path)
+		if err == nil {
+			rn, err := f.ReadAt(readP, needSkip)
+			f.Close()
+			if err != nil {
+				if err == io.EOF {
+					// file is shorter than it should be. pad with zeroes
+					for i := range readP[rn:] {
+						readP[i+rn] = 0
+					}
+				} else {
+					return n, err
+				}
+			}
+		} else {
+			// if the file is missing we pad with zeros
+			for i := range readP {
+				readP[i] = 0
+			}
+		}
+		// The return value of ReadAt doesn't matter. Either it read exactly len(readP) bytes, or it returned a non-nil error and we padded with zeroes.
+		pn := len(readP)
+		n += pn
+		p = p[pn:]
+		if int64(pn)+needSkip == fileSize {
+			files = files[1:]
+		}
+		needSkip = 0
+	}
+
+	if n != wantN {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }

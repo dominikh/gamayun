@@ -29,20 +29,20 @@ type metainfo struct {
 }
 
 type InfoDictionary struct {
-	PieceLength uint64 `bencode:"piece length"`
+	PieceLength int64  `bencode:"piece length"`
 	Pieces      []byte `bencode:"pieces"`
 	Private     bool   `bencode:"private"`
 	Name        string `bencode:"name"`
 
 	// Single file Mode
-	Length uint64 `bencode:"length"`
+	Length int64 `bencode:"length"`
 
 	// Multi File Mode
 	Files []InfoFile `bencode:"files"`
 }
 
 type InfoFile struct {
-	Length uint64   `bencode:"length"`
+	Length int64    `bencode:"length"`
 	Path   []string `bencode:"path"`
 }
 
