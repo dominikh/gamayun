@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -246,7 +247,10 @@ func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) 
 		q["event"] = []string{event}
 	}
 
-	req.URL.RawQuery = q.Encode()
+	// Replace "+" with "%20" in encoded info hash. net/url thinks
+	// that "+" is an acceptable encoding of spaces in the query
+	// portion. It isn't.
+	req.URL.RawQuery = strings.Replace(q.Encode(), "+", "%20", -1)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
