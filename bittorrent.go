@@ -44,7 +44,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -54,16 +53,23 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-type Statistics struct {
-	UploadedData  uint64 // XXX not implemented yet
-	UploadedTotal uint64
-
-	DownloadedData  uint64 // XXX not implemented yet
-	DownloadedTotal uint64
-}
+// How often each peer updates the global and per-torrent traffic statistics.
+const peerStatisticsInterval = 500 * time.Millisecond
 
 type Session struct {
-	Settings  Settings
+	Settings Settings
+
+	// XXX rename this field. these functions are only used for
+	// decision making, and are separate from events, which are
+	// delivered aysnchronously. calling it "callbacks" sort of
+	// suggests that we'd use it for all kinds of events.
+	//
+	// XXX there'll be some overlap between these callbacks and
+	// events. someone who wants to control incoming connections will
+	// set PeerIncoming, but we'll also deliver an event when a new
+	// peer connects. figure out if we can get rid of the overlap or
+	// unify callbacks and events. if not, be clear when documenting
+	// what to use callbacks for.
 	Callbacks struct {
 		// If set, PeerIncoming gets called when a new incoming connection is being made.
 		// If it returns false, the connection will be rejected.
@@ -87,14 +93,13 @@ type Session struct {
 		// Rejected connections will trigger PeerDisconnected.
 		PeerHandshakePeerID func(peer *Peer, peerID [20]byte) (allow bool)
 
+		// XXX this should be an event instead, because we don't depend on a return value
+		//
 		// If set, PeerDisconnected gets called after a peer connection has been closed.
 		PeerDisconnected func(peer *Peer, err error)
 	}
 
 	PeerID [20]byte
-
-	// XXX check alignment on ARM
-	statistics Statistics
 
 	peersWg sync.WaitGroup
 
@@ -103,16 +108,36 @@ type Session struct {
 	listener net.Listener
 	torrents map[protocol.InfoHash]*Torrent
 	peers    container.Set[*Peer]
+
+	eventsMu sync.Mutex
+	events   []Event
 }
 
-func (sess *Session) Statistics() Statistics {
-	return Statistics{
-		UploadedData:    atomic.LoadUint64(&sess.statistics.UploadedData),
-		UploadedTotal:   atomic.LoadUint64(&sess.statistics.UploadedTotal),
-		DownloadedData:  atomic.LoadUint64(&sess.statistics.DownloadedData),
-		DownloadedTotal: atomic.LoadUint64(&sess.statistics.DownloadedTotal),
-	}
+func (sess *Session) Events() []Event {
+	sess.eventsMu.Lock()
+	defer sess.eventsMu.Unlock()
+	s := sess.events
+	sess.events = make([]Event, 0, len(s))
+	return s
 }
+
+type Event interface {
+	isEvent()
+}
+
+func (PeerTrafficDownEvent) isEvent() {}
+func (PeerTrafficUpEvent) isEvent()   {}
+
+type PeerTrafficDownEvent struct {
+	// XXX report both raw traffic and data traffic
+	Start   time.Time
+	Stop    time.Time
+	Peer    *Peer
+	Torrent *Torrent
+	Bytes   uint64
+}
+
+type PeerTrafficUpEvent PeerTrafficDownEvent
 
 type request struct {
 	Index  uint32
@@ -433,26 +458,116 @@ func (peer *Peer) blockReader() error {
 }
 
 func (peer *Peer) readPeer() error {
-	for {
-		msg, err := peer.conn.ReadMessage()
-		if err != nil {
-			return err
+	var downloaded uint64
+
+	last := time.Now()
+	lastWasZero := false
+	updateStats := func() {
+		now := time.Now()
+		defer func() { last = now }()
+		if downloaded == 0 {
+			if lastWasZero {
+				// Only skip emitting an event if the previous event was for zero bytes.
+				// We want to emit a zero bytes event at least once so that clients can update the displayed rate
+				return
+			}
+			lastWasZero = true
+		} else {
+			lastWasZero = false
 		}
-		atomic.AddUint64(&peer.session.statistics.DownloadedTotal, uint64(msg.Size()))
+
+		ev := PeerTrafficDownEvent{
+			Start:   last,
+			Stop:    now,
+			Peer:    peer,
+			Torrent: peer.torrent,
+			Bytes:   downloaded,
+		}
+
+		peer.session.eventsMu.Lock()
+		peer.session.events = append(peer.session.events, ev)
+		peer.session.eventsMu.Unlock()
+
+		downloaded = 0
+	}
+
+	msgs := make(chan protocol.Message)
+	errs := make(chan error, 1)
+	go func() {
+		for {
+			msg, err := peer.conn.ReadMessage()
+			if err != nil {
+				errs <- err
+				return
+			}
+			select {
+			case msgs <- msg:
+			case <-peer.done:
+				return
+			}
+		}
+	}()
+
+	defer updateStats()
+	t := time.NewTicker(peerStatisticsInterval)
+	for {
 		select {
-		case peer.msgs <- msg:
+		case msg := <-msgs:
+			downloaded += uint64(msg.Size())
+			select {
+			case peer.msgs <- msg:
+			case <-peer.done:
+				return ErrClosing
+			}
+		case <-t.C:
+			updateStats()
 		case <-peer.done:
-			return nil
+			return ErrClosing
+		case err := <-errs:
+			return err
 		}
 	}
 }
 
 func (peer *Peer) writePeer() error {
+	var uploaded uint64
+	last := time.Now()
+	lastWasZero := false
 	writeMsg := func(msg protocol.Message) error {
-		atomic.AddUint64(&peer.session.statistics.UploadedTotal, uint64(msg.Size()))
+		uploaded += uint64(msg.Size())
 		return peer.conn.WriteMessage(msg)
 	}
+	updateStats := func() {
+		now := time.Now()
+		defer func() { last = now }()
+		if uploaded == 0 {
+			if lastWasZero {
+				// Only skip emitting an event if the previous event was for zero bytes.
+				// We want to emit a zero bytes event at least once so that clients can update the displayed rate
+				return
+			}
+			lastWasZero = true
+		} else {
+			lastWasZero = false
+		}
 
+		ev := PeerTrafficUpEvent{
+			Start:   last,
+			Stop:    now,
+			Peer:    peer,
+			Torrent: peer.torrent,
+			Bytes:   uploaded,
+		}
+
+		peer.session.eventsMu.Lock()
+		peer.session.events = append(peer.session.events, ev)
+		peer.session.eventsMu.Unlock()
+
+		uploaded = 0
+	}
+
+	defer updateStats()
+	t := time.NewTicker(peerStatisticsInterval)
 	for {
 		if msg, ok := channel.TryRecv(peer.controlWrites); ok {
 			// OPT use channel.Collect
@@ -471,6 +586,8 @@ func (peer *Peer) writePeer() error {
 			if err := writeMsg(msg); err != nil {
 				return err
 			}
+		case <-t.C:
+			updateStats()
 		case <-peer.done:
 			return nil
 		}
@@ -810,15 +927,13 @@ const (
 )
 
 type Torrent struct {
-	Metainfo     *Metainfo
-	Hash         protocol.InfoHash
+	Metainfo *Metainfo
+	Hash     protocol.InfoHash
+
 	availability Pieces
-
-	data *dataStorage
-
-	action Action
-
-	session *Session
+	data         *dataStorage
+	action       Action
+	session      *Session
 
 	mu sync.RWMutex
 	// Pieces we have

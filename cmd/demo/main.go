@@ -85,8 +85,25 @@ func main() {
 	}
 
 	t := time.NewTicker(5 * time.Second)
+
+	// XXX leak
+	down := map[*bittorrent.Torrent]uint64{}
+	up := map[*bittorrent.Torrent]uint64{}
 	for range t.C {
-		stats := client.Statistics()
-		fmt.Printf("%d up / %d down\n", stats.UploadedTotal, stats.DownloadedTotal)
+		for _, ev := range client.Events() {
+			switch ev := ev.(type) {
+			case bittorrent.PeerTrafficDownEvent:
+				down[ev.Torrent] += ev.Bytes
+			case bittorrent.PeerTrafficUpEvent:
+				up[ev.Torrent] += ev.Bytes
+			}
+		}
+
+		for torr, n := range down {
+			fmt.Printf("%s: %d down\n", torr, n)
+		}
+		for torr, n := range up {
+			fmt.Printf("%s: %d up\n", torr, n)
+		}
 	}
 }
