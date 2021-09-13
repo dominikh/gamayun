@@ -91,11 +91,11 @@ func main() {
 	for range t.C {
 		for _, ev := range client.Events() {
 			switch ev := ev.(type) {
-			case bittorrent.PeerTrafficEvent:
-				tr := traffic[ev.Torrent]
+			case bittorrent.EventPeerTraffic:
+				tr := traffic[ev.Peer.Torrent]
 				tr.up += ev.Up
 				tr.down += ev.Down
-				traffic[ev.Torrent] = tr
+				traffic[ev.Peer.Torrent] = tr
 			}
 		}
 

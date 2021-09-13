@@ -155,22 +155,6 @@ func (sess *Session) Events() []Event {
 	return s
 }
 
-type Event interface {
-	isEvent()
-}
-
-func (PeerTrafficEvent) isEvent() {}
-
-type PeerTrafficEvent struct {
-	// XXX report both raw traffic and data traffic
-	Start   time.Time
-	Stop    time.Time
-	Peer    *Peer
-	Torrent *Torrent
-	Up      uint64
-	Down    uint64
-}
-
 type request struct {
 	Index  uint32
 	Begin  uint32
@@ -465,7 +449,7 @@ func (peer *Peer) blockReader() error {
 				// XXX make sure req.Length isn't too long
 				// OPT reuse buffers
 				buf := make([]byte, req.Length)
-				_, err := peer.torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
+				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
 				if err != nil {
 					return err
 				}
@@ -637,7 +621,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 		torr.peers.Delete(peer)
 	}()
 
-	peer.torrent = torr
+	peer.Torrent = torr
 
 	if err := peer.conn.SendHandshake(hash, sess.PeerID); err != nil {
 		return WriteError{err}
@@ -736,7 +720,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 				}
 			}
 
-			torr := peer.torrent
+			torr := peer.Torrent
 			torr.mu.RLock()
 			if torr.have.count != peer.lastHaveSent.count {
 				have := torr.have.Copy()
@@ -760,7 +744,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 						for n := 7; n >= 0; n-- {
 							bit++
 							if b&1<<n != 0 {
-								peer.torrent.availability.inc(uint32(bit))
+								peer.Torrent.availability.inc(uint32(bit))
 							}
 						}
 					}
@@ -770,11 +754,11 @@ func (sess *Session) runPeer(peer *Peer) error {
 					// nothing to do
 				case protocol.MessageTypeHaveAll:
 					// OPT more efficient representation for HaveAll
-					for i := 0; i < peer.torrent.NumPieces(); i++ {
+					for i := 0; i < peer.Torrent.NumPieces(); i++ {
 						peer.have.Set(uint32(i))
 					}
 					// XXX decrement when peer disconnects
-					peer.torrent.availability.haveAll++
+					peer.Torrent.availability.haveAll++
 				default:
 					// XXX instead of panicing we should kill the peer for a protocol violation
 					panic(fmt.Sprintf("unexpected message %s", msg))
@@ -823,7 +807,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 					// XXX ignore Have if we've gotten HaveAll before
 					peer.have.Set(msg.Index)
 					// XXX decrement when peer disconnects
-					peer.torrent.availability.inc(msg.Index)
+					peer.Torrent.availability.inc(msg.Index)
 				case protocol.MessageTypeChoke:
 					// XXX handle
 					peer.peerChoking = true
@@ -1023,7 +1007,7 @@ type Peer struct {
 	peerChoking    bool
 	peerInterested bool
 	lastHaveSent   Bitset
-	torrent        *Torrent
+	Torrent        *Torrent // XXX make sure this doesn't need locking, now that it is exported
 
 	// mutable, needs lock held
 
@@ -1058,13 +1042,12 @@ func (peer *Peer) updateStats(now time.Time) {
 		peer.statistics.lastWasZero = false
 	}
 
-	ev := PeerTrafficEvent{
-		Start:   peer.statistics.last,
-		Stop:    now,
-		Peer:    peer,
-		Torrent: peer.torrent,
-		Up:      up,
-		Down:    down,
+	ev := EventPeerTraffic{
+		Start: peer.statistics.last,
+		Stop:  now,
+		Peer:  peer,
+		Up:    up,
+		Down:  down,
 	}
 
 	peer.session.eventsMu.Lock()
