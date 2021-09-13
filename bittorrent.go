@@ -1,3 +1,36 @@
+// Scalability
+//
+// TODO. We avoid polling that is O(torrents) by using events. E.g. instead of inspecting each torrent for its state or statistics, we'll emit events only for those torrents that had activity.
+//
+// Callbacks, events, and blocking calls
+//
+// We use three different mechanisms for communicating with users of this package.
+//
+// Callbacks
+//
+// Callbacks are used when we need to request data from the user.
+// For example, in order to implement peer whitelists or blacklists, we'll ask the user to make a decision whenever a new incoming connection is made.
+//
+// Callbacks are executed synchronously as we cannot proceed until we get their results.
+// In some cases, this means that callbacks should finish as quickly as possible, so that good performance can be maintained.
+// In other cases, deliberately delays can be used to implement rate control, for example to throttle the rate of incoming connections.
+//
+// Events
+//
+// Events are used when we need to send data to the user but don't require a response.
+// For example, periodic per-peer traffic statistics are reported as events.
+// Events have to be polled periodically by the user.
+// Not doing so will cause events to accumulate and grow memory usage without bounds.
+//
+// Some events may overlap with callbacks.
+// For example, there is both a callback and an event for new peer connections.
+// While callbacks can make decisions and block execution, events can do neither.
+//
+// Blocking calls
+//
+// Requests and actions originating from the user are handled by blocking calls.
+// For example, verifying a torrent's data is done via a function call that will not return until verification has completed.
+// If the user wishes to run actions in parallel with their other code, they have to set up concurrency themselves, by using goroutines.
 package bittorrent
 
 // XXX support removing torrents

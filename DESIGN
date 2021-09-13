@@ -1,6 +1,8 @@
 - meant for private trackers. no DHT etc
 - made for long-term seeding of tens of thousands of torrents
+  - avoid O(torrents) operations. e.g a client UI shouldn't require iterating over all torrents on each update to get its state or statistics
 - made for remote UIs
 - no support for ultra-low memory systems. we won't be wasteful with memory, but we'll use more memory if it significantly improves performance
 - probably no support for racing. we'll not violate protocols to race, e.g. by ignoring the announce interval
 - probably no support for ancient clients. we'll depend on protocol extensions when they're ubiquitous 
+
