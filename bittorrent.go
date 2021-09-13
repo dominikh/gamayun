@@ -44,6 +44,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -125,19 +126,17 @@ type Event interface {
 	isEvent()
 }
 
-func (PeerTrafficDownEvent) isEvent() {}
-func (PeerTrafficUpEvent) isEvent()   {}
+func (PeerTrafficEvent) isEvent() {}
 
-type PeerTrafficDownEvent struct {
+type PeerTrafficEvent struct {
 	// XXX report both raw traffic and data traffic
 	Start   time.Time
 	Stop    time.Time
 	Peer    *Peer
 	Torrent *Torrent
-	Bytes   uint64
+	Up      uint64
+	Down    uint64
 }
-
-type PeerTrafficUpEvent PeerTrafficDownEvent
 
 type request struct {
 	Index  uint32
@@ -458,39 +457,6 @@ func (peer *Peer) blockReader() error {
 }
 
 func (peer *Peer) readPeer() error {
-	var downloaded uint64
-
-	last := time.Now()
-	lastWasZero := false
-	updateStats := func() {
-		now := time.Now()
-		defer func() { last = now }()
-		if downloaded == 0 {
-			if lastWasZero {
-				// Only skip emitting an event if the previous event was for zero bytes.
-				// We want to emit a zero bytes event at least once so that clients can update the displayed rate
-				return
-			}
-			lastWasZero = true
-		} else {
-			lastWasZero = false
-		}
-
-		ev := PeerTrafficDownEvent{
-			Start:   last,
-			Stop:    now,
-			Peer:    peer,
-			Torrent: peer.torrent,
-			Bytes:   downloaded,
-		}
-
-		peer.session.eventsMu.Lock()
-		peer.session.events = append(peer.session.events, ev)
-		peer.session.eventsMu.Unlock()
-
-		downloaded = 0
-	}
-
 	msgs := make(chan protocol.Message)
 	errs := make(chan error, 1)
 	go func() {
@@ -508,19 +474,15 @@ func (peer *Peer) readPeer() error {
 		}
 	}()
 
-	defer updateStats()
-	t := time.NewTicker(peerStatisticsInterval)
 	for {
 		select {
 		case msg := <-msgs:
-			downloaded += uint64(msg.Size())
+			atomic.AddUint64(&peer.statistics.downloaded, uint64(msg.Size()))
 			select {
 			case peer.msgs <- msg:
 			case <-peer.done:
 				return ErrClosing
 			}
-		case <-t.C:
-			updateStats()
 		case <-peer.done:
 			return ErrClosing
 		case err := <-errs:
@@ -530,44 +492,11 @@ func (peer *Peer) readPeer() error {
 }
 
 func (peer *Peer) writePeer() error {
-	var uploaded uint64
-	last := time.Now()
-	lastWasZero := false
 	writeMsg := func(msg protocol.Message) error {
-		uploaded += uint64(msg.Size())
+		atomic.AddUint64(&peer.statistics.uploaded, uint64(msg.Size()))
 		return peer.conn.WriteMessage(msg)
 	}
-	updateStats := func() {
-		now := time.Now()
-		defer func() { last = now }()
-		if uploaded == 0 {
-			if lastWasZero {
-				// Only skip emitting an event if the previous event was for zero bytes.
-				// We want to emit a zero bytes event at least once so that clients can update the displayed rate
-				return
-			}
-			lastWasZero = true
-		} else {
-			lastWasZero = false
-		}
 
-		ev := PeerTrafficUpEvent{
-			Start:   last,
-			Stop:    now,
-			Peer:    peer,
-			Torrent: peer.torrent,
-			Bytes:   uploaded,
-		}
-
-		peer.session.eventsMu.Lock()
-		peer.session.events = append(peer.session.events, ev)
-		peer.session.eventsMu.Unlock()
-
-		uploaded = 0
-	}
-
-	defer updateStats()
-	t := time.NewTicker(peerStatisticsInterval)
 	for {
 		if msg, ok := channel.TryRecv(peer.controlWrites); ok {
 			// OPT use channel.Collect
@@ -586,8 +515,6 @@ func (peer *Peer) writePeer() error {
 			if err := writeMsg(msg); err != nil {
 				return err
 			}
-		case <-t.C:
-			updateStats()
 		case <-peer.done:
 			return nil
 		}
@@ -741,14 +668,22 @@ func (sess *Session) runPeer(peer *Peer) error {
 		// XXX implement sending bitfield. don't forget to remove '|| true' from the previous condition
 	}
 
+	trafficTicker := time.NewTicker(peerStatisticsInterval)
 	t := time.NewTicker(time.Second)
+
+	defer func() {
+		peer.updateStats(time.Now())
+	}()
 	for {
 		select {
 		case err := <-errs:
 			// This will also fire when we're shutting down, because blockReader, readPeer and writePeer will fail,
 			// because the peer connections will get closed by Session.Run
 			return err
+		case now := <-trafficTicker.C:
+			peer.updateStats(now)
 		case <-t.C:
+			// XXX move choking/unchoking to the session goroutine
 			if !peer.peerInterested && !peer.amChoking {
 				peer.amChoking = true
 				err := peer.controlWrite(protocol.Message{
@@ -1061,10 +996,47 @@ type Peer struct {
 
 	// accessed atomically
 	droppedRequests uint32
+	// amount of data transfered since the last time we've reported statistics
+	statistics struct {
+		// XXX check alignment on 32-bit systems
+		uploaded    uint64
+		downloaded  uint64
+		last        time.Time
+		lastWasZero bool
+	}
 }
 
 func (peer *Peer) String() string {
 	return peer.conn.String()
+}
+
+func (peer *Peer) updateStats(now time.Time) {
+	defer func() { peer.statistics.last = now }()
+	up := atomic.SwapUint64(&peer.statistics.uploaded, 0)
+	down := atomic.SwapUint64(&peer.statistics.downloaded, 0)
+	if up == 0 && down == 0 {
+		if peer.statistics.lastWasZero {
+			// Only skip emitting an event if the previous event was for zero bytes.
+			// We want to emit a zero bytes event at least once so that clients can update the displayed rate
+			return
+		}
+		peer.statistics.lastWasZero = true
+	} else {
+		peer.statistics.lastWasZero = false
+	}
+
+	ev := PeerTrafficEvent{
+		Start:   peer.statistics.last,
+		Stop:    now,
+		Peer:    peer,
+		Torrent: peer.torrent,
+		Up:      up,
+		Down:    down,
+	}
+
+	peer.session.eventsMu.Lock()
+	peer.session.events = append(peer.session.events, ev)
+	peer.session.eventsMu.Unlock()
 }
 
 type Error struct {
