@@ -689,7 +689,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 	t := time.NewTicker(time.Second)
 
 	defer func() {
-		peer.updateStats(time.Now())
+		peer.updateStats()
 	}()
 	for {
 		select {
@@ -697,8 +697,8 @@ func (sess *Session) runPeer(peer *Peer) error {
 			// This will also fire when we're shutting down, because blockReader, readPeer and writePeer will fail,
 			// because the peer connections will get closed by Session.Run
 			return err
-		case now := <-trafficTicker.C:
-			peer.updateStats(now)
+		case <-trafficTicker.C:
+			peer.updateStats()
 		case <-t.C:
 			// XXX move choking/unchoking to the session goroutine
 			if !peer.peerInterested && !peer.amChoking {
@@ -1027,7 +1027,8 @@ func (peer *Peer) String() string {
 	return peer.conn.String()
 }
 
-func (peer *Peer) updateStats(now time.Time) {
+func (peer *Peer) updateStats() {
+	now := time.Now()
 	defer func() { peer.statistics.last = now }()
 	up := atomic.SwapUint64(&peer.statistics.uploaded, 0)
 	down := atomic.SwapUint64(&peer.statistics.downloaded, 0)
