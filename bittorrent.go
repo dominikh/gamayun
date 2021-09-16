@@ -556,12 +556,14 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// XXX once we support removing torrents, this will race
 
 	torr.mu.Lock()
+	torr.stateMu.Lock()
 	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
 		peer.conn.Close()
-		torr.mu.Unlock()
+		torr.stateMu.Unlock()
 		return StoppedTorrentError{hash}
 	}
+	torr.stateMu.Unlock()
 	peerID := torr.trackerSession.PeerID
 	torr.peers.Add(peer)
 	defer func() {
@@ -894,12 +896,15 @@ type Torrent struct {
 
 	availability Pieces
 	data         *dataStorage
-	action       Action
 	session      *Session
 
-	mu             sync.RWMutex
-	trackerSession trackerSession
+	// Mutex used to prevent concurrent Start and Stop calls
+	stateMu        sync.Mutex
 	state          TorrentState
+	action         Action
+	trackerSession trackerSession
+
+	mu sync.RWMutex
 	// Pieces we have
 	have  Bitset
 	peers container.Set[*Peer]
@@ -927,8 +932,8 @@ func (sess *Session) isClosing() bool {
 }
 
 func (torr *Torrent) Start() {
-	torr.mu.Lock()
-	defer torr.mu.Unlock()
+	torr.stateMu.Lock()
+	defer torr.stateMu.Unlock()
 
 	if torr.session.isClosing() {
 		// Don't allow starting a torrent in an already stopped session
@@ -964,14 +969,17 @@ func (torr *Torrent) Start() {
 }
 
 func (torr *Torrent) Stop(ctx context.Context) {
+	torr.stateMu.Lock()
+	defer torr.stateMu.Unlock()
+
 	if torr.action != nil {
 		torr.action.Stop()
 	} else {
-		torr.mu.Lock()
 		if torr.state != TorrentStateStopped {
 			torr.state = TorrentStateStopped
-			peers := container.CopyMap(torr.peers) // copy the map, because runPeer will delete from it when it returns
-			// Don't hold the lock too long, because runPeer needs the lock when returning
+
+			torr.mu.Lock()
+			peers := container.CopyMap(torr.peers)
 			torr.mu.Unlock()
 
 			for peer := range peers {
@@ -985,8 +993,6 @@ func (torr *Torrent) Stop(ctx context.Context) {
 				up:       torr.trackerSession.up,
 				down:     torr.trackerSession.down,
 			})
-		} else {
-			torr.mu.Unlock()
 		}
 	}
 }
@@ -1356,9 +1362,9 @@ func NewVerify(torr *Torrent) Action {
 }
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
-	// XXX Stop is asynchronous, make it synchronous and wait
 	// XXX allow timing this out?
 	torr.Stop(context.Background())
+	// XXX guard against a concurrent call to Start
 	torr.action = l
 	res, stopped, err := torr.action.Run()
 	torr.action = nil
