@@ -787,13 +787,9 @@ func (sess *Session) Run() error {
 	t := time.NewTicker(1 * time.Second)
 	for {
 		select {
+		// XXX don't depend on a timer for processing announces
 		case <-t.C:
-			sess.mu.Lock()
-			anns := sess.announces
-			sess.announces = nil
-			sess.mu.Unlock()
-
-			for _, ann := range anns {
+			for _, ann := range sess.getAnnounces() {
 				// XXX concurrency
 				sess.announce(context.Background(), ann)
 			}
@@ -804,6 +800,19 @@ func (sess *Session) Run() error {
 	}
 
 	// XXX periodically announce torrents, choke/unchoke peers, ...
+}
+
+// getAnnounces empties the list of outstanding announces and returns it
+func (sess *Session) getAnnounces() []announce {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.getAnnouncesLocked()
+}
+
+func (sess *Session) getAnnouncesLocked() []announce {
+	out := sess.announces
+	sess.announces = nil
+	return out
 }
 
 func (sess *Session) Shutdown(ctx context.Context) error {
@@ -824,18 +833,17 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	for _, torr := range sess.torrents {
 		torr.Stop(ctx)
 	}
+	// Torrent.Stop closes all peers associated with it; this loop
+	// closes the remaining peers, the ones which haven't finished the
+	// handshake yet.
 	for peer := range sess.peers {
-		peer.conn.Close()
-		<-peer.done
+		peer.Close()
 	}
 
 	// It's okay if Session.Run hasn't returned yet; it clears
 	// Session.announces and there is no risk of an announce being
 	// processed more than once
-	sess.mu.Lock()
-	anns := sess.announces
-	sess.announces = nil
-	sess.mu.Unlock()
+	anns := sess.getAnnounces()
 	for _, ann := range anns {
 		// XXX concurrency
 		sess.announce(context.Background(), ann)
@@ -917,6 +925,11 @@ func (torr *Torrent) Start() {
 	torr.mu.Lock()
 	defer torr.mu.Unlock()
 
+	if _, ok := channel.TryRecv(torr.session.closing); ok {
+		// Don't allow starting a torrent in an already stopped session
+		return
+	}
+
 	if torr.state != TorrentStateStopped {
 		return
 	}
@@ -957,8 +970,7 @@ func (torr *Torrent) Stop(ctx context.Context) {
 			torr.mu.Unlock()
 
 			for peer := range peers {
-				peer.conn.Close()
-				<-peer.done
+				peer.Close()
 			}
 
 			torr.session.addAnnounce(announce{
@@ -1047,6 +1059,12 @@ type Peer struct {
 		last        time.Time
 		lastWasZero bool
 	}
+}
+
+// Close closes the peer connection and waits for runPeer to return.
+func (peer *Peer) Close() {
+	peer.conn.Close()
+	<-peer.done
 }
 
 func (peer *Peer) String() string {
