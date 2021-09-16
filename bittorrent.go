@@ -75,16 +75,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/zeebo/bencode"
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/container"
 	"honnef.co/go/bittorrent/protocol"
-
-	"github.com/zeebo/bencode"
 )
 
 // How often each peer updates the global and per-torrent traffic statistics.
@@ -133,20 +133,27 @@ type Session struct {
 		PeerDisconnected func(peer *Peer, err error)
 	}
 
-	PeerID [20]byte
-
 	peersWg sync.WaitGroup
 
-	closing  chan struct{}
-	mu       sync.RWMutex
-	listener net.Listener
-	torrents map[protocol.InfoHash]*Torrent
-	peers    container.Set[*Peer]
+	closing   chan struct{}
+	mu        sync.RWMutex
+	listener  net.Listener
+	torrents  map[protocol.InfoHash]*Torrent
+	peers     container.Set[*Peer]
+	announces []announce
 
 	eventsMu sync.Mutex
 	events   []Event
 }
 
+// OPT maybe Events should copy into a user-provided buffer. this
+// would avoid allocations, but would make the user code more
+// complicated: it would need to figure out a good size for the
+// buffer, and iteratively call Events to fully drain the slice, but
+// without getting stuck draining forever.
+//
+// alternatively, we could let the user pop a single event at a time,
+// but that would have a lot of function call and locking overhead.
 func (sess *Session) Events() []Event {
 	sess.eventsMu.Lock()
 	defer sess.eventsMu.Unlock()
@@ -175,8 +182,6 @@ type Settings struct {
 
 func NewSession() *Session {
 	return &Session{
-		// XXX generate peer ID
-		PeerID:   [20]byte{123, 123, 126, 36, 123, 42, 122},
 		Settings: DefaultSettings,
 		torrents: map[protocol.InfoHash]*Torrent{},
 		peers:    container.NewSet[*Peer](),
@@ -279,61 +284,6 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	sess.torrents[torr.Hash] = torr
 
 	return torr, nil
-}
-
-func (sess *Session) announce(ctx context.Context, torr *Torrent, event string) (*TrackerResponse, error) {
-	log.Printf("announcing %q for %s", event, torr.Hash)
-
-	type AnnounceResponse struct {
-		Torrent  *Torrent
-		Response TrackerResponse
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, torr.Metainfo.Announce, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// XXX set trackerid
-
-	q := req.URL.Query()
-	// XXX remove once we support BEP 23
-	q["info_hash"] = []string{string(torr.Hash[:])}
-	q["peer_id"] = []string{string(sess.PeerID[:])}
-	// XXX proper values
-	q["port"] = []string{sess.Settings.ListenPort}
-	q["uploaded"] = []string{"0"}
-	q["downloaded"] = []string{"0"}
-	// XXX support multi-file mode
-	// q["left"] = []string{strconv.FormatUint(areq.Torrent.Metainfo.Info.Length, 10)}
-	q["left"] = []string{"0"}
-	q["numwant"] = []string{"200"}
-	q["compact"] = []string{"1"}
-	q["no_peer_id"] = []string{"1"}
-	if event != "" {
-		q["event"] = []string{event}
-	}
-
-	// Replace "+" with "%20" in encoded info hash. net/url thinks
-	// that "+" is an acceptable encoding of spaces in the query
-	// portion. It isn't.
-	req.URL.RawQuery = strings.Replace(q.Encode(), "+", "%20", -1)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// XXX check status code of response
-
-	var tresp TrackerResponse
-
-	if err := bencode.NewDecoder(resp.Body).Decode(&tresp); err != nil {
-		return nil, err
-	}
-
-	return &tresp, nil
 }
 
 var ErrClosing = errors.New("client is shutting down")
@@ -612,18 +562,18 @@ func (sess *Session) runPeer(peer *Peer) error {
 		torr.mu.Unlock()
 		return StoppedTorrentError{hash}
 	}
+	peerID := torr.trackerSession.PeerID
 	torr.peers.Add(peer)
-	torr.mu.Unlock()
-
 	defer func() {
 		torr.mu.Lock()
 		defer torr.mu.Unlock()
 		torr.peers.Delete(peer)
 	}()
+	torr.mu.Unlock()
 
 	peer.Torrent = torr
 
-	if err := peer.conn.SendHandshake(hash, sess.PeerID); err != nil {
+	if err := peer.conn.SendHandshake(hash, peerID); err != nil {
 		return WriteError{err}
 	}
 
@@ -642,7 +592,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// OPT multiple reader goroutines?
 	//
 	// These goroutines will exit either when they encounter read/write errors on the connection or when Peer.done gets closed.
-	// This combination should ensure that the goroutines always terminate when RunPeer returns.
+	// This combination should ensure that the goroutines always terminate when runPeer returns.
 	go func() { channel.TrySend(errs, peer.blockReader()) }()
 	go func() { channel.TrySend(errs, peer.readPeer()) }()
 	go func() { channel.TrySend(errs, peer.writePeer()) }()
@@ -688,9 +638,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 	trafficTicker := time.NewTicker(peerStatisticsInterval)
 	t := time.NewTicker(time.Second)
 
-	defer func() {
-		peer.updateStats()
-	}()
+	defer peer.updateStats()
 	for {
 		select {
 		case err := <-errs:
@@ -830,6 +778,34 @@ func (sess *Session) runPeer(peer *Peer) error {
 	}
 }
 
+func (sess *Session) Run() error {
+	errs := make(chan error, 1)
+	go func() {
+		errs <- sess.listen()
+	}()
+
+	t := time.NewTicker(1 * time.Second)
+	for {
+		select {
+		case <-t.C:
+			sess.mu.Lock()
+			anns := sess.announces
+			sess.announces = nil
+			sess.mu.Unlock()
+
+			for _, ann := range anns {
+				// XXX concurrency
+				sess.announce(context.Background(), ann)
+			}
+		case err := <-errs:
+			// XXX make sure Shutdown works through all the remaining announces
+			return err
+		}
+	}
+
+	// XXX periodically announce torrents, choke/unchoke peers, ...
+}
+
 func (sess *Session) Shutdown(ctx context.Context) error {
 	// XXX close all the files in all the torrents. although, once we
 	// have lazy file opening, this should happen in Torrent.Stop
@@ -843,30 +819,40 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	if sess.listener != nil {
 		sess.listener.Close()
 	}
+	sess.mu.Unlock()
 
 	for _, torr := range sess.torrents {
 		torr.Stop(ctx)
 	}
 	for peer := range sess.peers {
 		peer.conn.Close()
+		<-peer.done
 	}
+
+	// It's okay if Session.Run hasn't returned yet; it clears
+	// Session.announces and there is no risk of an announce being
+	// processed more than once
+	sess.mu.Lock()
+	anns := sess.announces
+	sess.announces = nil
 	sess.mu.Unlock()
+	for _, ann := range anns {
+		// XXX concurrency
+		sess.announce(context.Background(), ann)
+	}
+
+	// At this point it should be impossible for anyone to add new announces
 
 	// XXX allow ctx to cancel waiting
 	// sess.torrentsWg.Wait()
 	// log.Println("All torrents done")
 
-	// XXX wait for torr.Stop to actually have done its job
-
 	sess.peersWg.Wait()
 	log.Println("All peers done")
+
+	// XXX flush outstanding announces
+
 	return nil
-}
-
-func (sess *Session) Run() error {
-	return sess.listen()
-
-	// XXX periodically announce torrents, choke/unchoke peers, ...
 }
 
 //go:generate go run golang.org/x/tools/cmd/stringer@master -type TorrentState
@@ -878,6 +864,22 @@ const (
 	TorrentStateSeeding
 )
 
+type trackerAnnounceKind uint8
+
+const (
+	trackerAnnounceNone trackerAnnounceKind = iota
+	trackerAnnounceStarting
+	trackerAnnounceStopping
+	trackerAnnouncePeriodic
+)
+
+type trackerSession struct {
+	PeerID       [20]byte
+	nextAnnounce time.Time
+	up           uint64
+	down         uint64
+}
+
 type Torrent struct {
 	Metainfo *Metainfo
 	Hash     protocol.InfoHash
@@ -887,14 +889,34 @@ type Torrent struct {
 	action       Action
 	session      *Session
 
-	mu sync.RWMutex
+	mu             sync.RWMutex
+	trackerSession trackerSession
+	state          TorrentState
 	// Pieces we have
 	have  Bitset
-	state TorrentState
 	peers container.Set[*Peer]
 }
 
+type announce struct {
+	infohash protocol.InfoHash
+	tracker  string
+	peerID   [20]byte
+	event    string
+	up       uint64
+	down     uint64
+	// XXX left
+}
+
+func (sess *Session) addAnnounce(ann announce) {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	sess.announces = append(sess.announces, ann)
+}
+
 func (torr *Torrent) Start() {
+	torr.mu.Lock()
+	defer torr.mu.Unlock()
+
 	if torr.state != TorrentStateStopped {
 		return
 	}
@@ -903,47 +925,51 @@ func (torr *Torrent) Start() {
 		return
 	}
 
-	torr.mu.Lock()
+	torr.trackerSession.nextAnnounce = time.Time{}
+	torr.trackerSession.up = 0
+	torr.trackerSession.down = 0
+	torr.trackerSession.PeerID = [20]byte{1, 2, 3, 4, 5, 6, 7, 8, 9}
+	// XXX generate peer ID
+	torr.session.addAnnounce(announce{
+		infohash: torr.Hash,
+		tracker:  torr.Metainfo.Announce,
+		peerID:   torr.trackerSession.PeerID,
+		event:    "started",
+	})
+
 	if torr.IsComplete() {
 		torr.state = TorrentStateSeeding
 	} else {
 		torr.state = TorrentStateLeeching
 		panic("XXX: we cannot download torrents yet")
 	}
-	torr.mu.Unlock()
-
-	// XXX initialize new stats for this "session" (delimieted by a start and stop announce)
-	// XXX allow interrupting the announce
-	// XXX is "started" the right event to send when we're a seeder?
-	// XXX get announce interval from response
-	// XXX handle announce failure
-	// XXX process the list of peers
-	torr.session.announce(context.Background(), torr, "started")
 }
 
 func (torr *Torrent) Stop(ctx context.Context) {
 	if torr.action != nil {
 		torr.action.Stop()
 	} else {
-		// XXX how should this handle an in-progress announce?
-
 		torr.mu.Lock()
-		defer torr.mu.Unlock()
 		if torr.state != TorrentStateStopped {
 			torr.state = TorrentStateStopped
+			peers := container.CopyMap(torr.peers) // copy the map, because runPeer will delete from it when it returns
+			// Don't hold the lock too long, because runPeer needs the lock when returning
+			torr.mu.Unlock()
 
-			for peer := range torr.peers {
-				// Right now this won't deadlock. runPeer runs in its
-				// own goroutine, so even though it needs to hold the
-				// same mutex as Torrent.Stop, it'll happily wait for
-				// Stop to return first. However, if we were to wait
-				// for runPeer to return before returning from Stop,
-				// we'd have a deadlock.
+			for peer := range peers {
 				peer.conn.Close()
-
+				<-peer.done
 			}
 
-			// XXX send final announce
+			torr.session.addAnnounce(announce{
+				infohash: torr.Hash,
+				peerID:   torr.trackerSession.PeerID,
+				event:    "stopped",
+				up:       torr.trackerSession.up,
+				down:     torr.trackerSession.down,
+			})
+		} else {
+			torr.mu.Unlock()
 		}
 	}
 }
@@ -1397,4 +1423,58 @@ func (ds *dataStorage) ReadAt(p []byte, off int64) (int, error) {
 		return n, io.ErrUnexpectedEOF
 	}
 	return n, nil
+}
+
+func (sess *Session) announce(ctx context.Context, ann announce) (*TrackerResponse, error) {
+	log.Printf("announcing %q for %s", ann.event, ann.infohash)
+
+	type AnnounceResponse struct {
+		Torrent  *Torrent
+		Response TrackerResponse
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ann.tracker, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// XXX set trackerid
+
+	q := req.URL.Query()
+	// XXX remove once we support BEP 23
+	q["info_hash"] = []string{string(ann.infohash[:])}
+	q["peer_id"] = []string{string(ann.peerID[:])}
+	q["port"] = []string{sess.Settings.ListenPort}
+	q["uploaded"] = []string{strconv.FormatUint(ann.up, 10)}
+	q["downloaded"] = []string{strconv.FormatUint(ann.down, 10)}
+	// XXX support multi-file mode
+	// q["left"] = []string{strconv.FormatUint(areq.Torrent.Metainfo.Info.Length, 10)}
+	q["left"] = []string{"0"} // XXX use correct value
+	q["numwant"] = []string{"200"}
+	q["compact"] = []string{"1"}
+	q["no_peer_id"] = []string{"1"}
+	if ann.event != "" {
+		q["event"] = []string{ann.event}
+	}
+
+	// Replace "+" with "%20" in encoded info hash. net/url thinks
+	// that "+" is an acceptable encoding of spaces in the query
+	// portion. It isn't.
+	req.URL.RawQuery = strings.Replace(q.Encode(), "+", "%20", -1)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// XXX check status code of response
+
+	var tresp TrackerResponse
+
+	if err := bencode.NewDecoder(resp.Body).Decode(&tresp); err != nil {
+		return nil, err
+	}
+
+	return &tresp, nil
 }
