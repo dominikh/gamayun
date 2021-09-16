@@ -1065,6 +1065,7 @@ type Peer struct {
 	// amount of data transfered since the last time we've reported statistics
 	statistics struct {
 		// XXX check alignment on 32-bit systems
+		// XXX differentiate raw traffic and data traffic
 		uploaded    uint64
 		downloaded  uint64
 		last        time.Time
@@ -1087,6 +1088,13 @@ func (peer *Peer) updateStats() {
 	defer func() { peer.statistics.last = now }()
 	up := atomic.SwapUint64(&peer.statistics.uploaded, 0)
 	down := atomic.SwapUint64(&peer.statistics.downloaded, 0)
+
+	// XXX the tracker cares about data traffic, not raw traffic
+	peer.Torrent.stateMu.Lock()
+	peer.Torrent.trackerSession.up += up
+	peer.Torrent.trackerSession.down += down
+	peer.Torrent.stateMu.Unlock()
+
 	if up == 0 && down == 0 {
 		if peer.statistics.lastWasZero {
 			// Only skip emitting an event if the previous event was for zero bytes.
