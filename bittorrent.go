@@ -277,7 +277,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
-	if _, ok := channel.TryRecv(sess.closing); ok {
+	if sess.isClosing() {
 		// Don't add new torrent to an already stopped client
 		return nil, ErrClosing
 	}
@@ -298,7 +298,7 @@ func (sess *Session) listen() error {
 	defer l.Close()
 
 	sess.mu.Lock()
-	if _, ok := channel.TryRecv(sess.closing); ok {
+	if sess.isClosing() {
 		l.Close()
 		return ErrClosing
 	}
@@ -321,7 +321,7 @@ func (sess *Session) listen() error {
 
 			sess.mu.Lock()
 			defer sess.mu.Unlock()
-			if _, ok := channel.TryRecv(sess.closing); ok {
+			if sess.isClosing() {
 				// We're shutting down, discard the connection and quit
 				pconn.Close()
 				return ErrClosing
@@ -921,11 +921,16 @@ func (sess *Session) addAnnounce(ann announce) {
 	sess.announces = append(sess.announces, ann)
 }
 
+func (sess *Session) isClosing() bool {
+	_, ok := channel.TryRecv(sess.closing)
+	return ok
+}
+
 func (torr *Torrent) Start() {
 	torr.mu.Lock()
 	defer torr.mu.Unlock()
 
-	if _, ok := channel.TryRecv(torr.session.closing); ok {
+	if torr.session.isClosing() {
 		// Don't allow starting a torrent in an already stopped session
 		return
 	}
