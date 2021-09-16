@@ -833,7 +833,7 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	sess.mu.Unlock()
 
 	for _, torr := range sess.torrents {
-		torr.Stop(ctx)
+		torr.Stop()
 	}
 	// Torrent.Stop closes all peers associated with it; this loop
 	// closes the remaining peers, the ones which haven't finished the
@@ -968,7 +968,7 @@ func (torr *Torrent) Start() {
 	}
 }
 
-func (torr *Torrent) Stop(ctx context.Context) {
+func (torr *Torrent) Stop() {
 	torr.stateMu.Lock()
 	defer torr.stateMu.Unlock()
 
@@ -1362,8 +1362,7 @@ func NewVerify(torr *Torrent) Action {
 }
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
-	// XXX allow timing this out?
-	torr.Stop(context.Background())
+	torr.Stop()
 	// XXX guard against a concurrent call to Start
 	torr.action = l
 	res, stopped, err := torr.action.Run()
