@@ -59,6 +59,8 @@ package bittorrent
 
 // XXX handle read/write timeouts, both on disk i/o and network i/o
 
+// XXX set user agent for HTTP requests
+
 import (
 	"bytes"
 	"context"
@@ -133,13 +135,15 @@ type Session struct {
 		PeerDisconnected func(peer *Peer, err error)
 	}
 
-	peersWg sync.WaitGroup
-
-	closing   chan struct{}
-	mu        sync.RWMutex
-	listener  net.Listener
-	torrents  map[protocol.InfoHash]*Torrent
-	peers     container.Set[*Peer]
+	closing  chan struct{}
+	mu       sync.RWMutex
+	listener net.Listener
+	torrents map[protocol.InfoHash]*Torrent
+	peers    container.Set[*Peer]
+	// XXX we can't keep all announces in one slice. if one announce
+	// for a torrent fails, then we must postpone all its other
+	// announces, too. which means we want a list of announces per
+	// torrent.
 	announces []announce
 
 	eventsMu sync.Mutex
@@ -346,9 +350,8 @@ func (sess *Session) listen() error {
 			}
 			sess.peers.Add(peer)
 
-			sess.peersWg.Add(1)
 			go func() {
-				defer sess.peersWg.Done()
+				defer close(peer.done)
 				err := sess.runPeer(peer)
 
 				sess.mu.Lock()
@@ -529,10 +532,7 @@ func (err CallbackRejectedPeerIDError) Error() string {
 }
 
 func (sess *Session) runPeer(peer *Peer) error {
-	defer func() {
-		close(peer.done)
-		peer.conn.Close()
-	}()
+	defer peer.conn.Close()
 
 	// XXX add handshake and peer id to DownloadedTotal stat
 	hash, err := peer.conn.ReadHandshake()
@@ -555,23 +555,24 @@ func (sess *Session) runPeer(peer *Peer) error {
 
 	// XXX once we support removing torrents, this will race
 
-	torr.mu.Lock()
 	torr.stateMu.Lock()
 	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
-		peer.conn.Close()
 		torr.stateMu.Unlock()
 		return StoppedTorrentError{hash}
 	}
-	torr.stateMu.Unlock()
 	peerID := torr.trackerSession.PeerID
+	// Add to torr.peers while under the torr.statsMu lock so that Torrent.Stop doesn't miss any peers
+	torr.peersMu.Lock()
 	torr.peers.Add(peer)
+	torr.peersMu.Unlock()
+	torr.stateMu.Unlock()
 	defer func() {
-		torr.mu.Lock()
-		defer torr.mu.Unlock()
+		// No need to hold torr.statsMu here, we're synchronized under Torrent.Stop waiting for runPeer to return
+		torr.peersMu.Lock()
+		defer torr.peersMu.Unlock()
 		torr.peers.Delete(peer)
 	}()
-	torr.mu.Unlock()
 
 	peer.Torrent = torr
 
@@ -841,6 +842,7 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	for peer := range sess.peers {
 		peer.Close()
 	}
+	log.Println("All peers done")
 
 	// It's okay if Session.Run hasn't returned yet; it clears
 	// Session.announces and there is no risk of an announce being
@@ -856,9 +858,6 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	// XXX allow ctx to cancel waiting
 	// sess.torrentsWg.Wait()
 	// log.Println("All torrents done")
-
-	sess.peersWg.Wait()
-	log.Println("All peers done")
 
 	// XXX flush outstanding announces
 
@@ -903,11 +902,12 @@ type Torrent struct {
 	state          TorrentState
 	action         Action
 	trackerSession trackerSession
+	peersMu        sync.Mutex
+	peers          container.Set[*Peer]
 
 	mu sync.RWMutex
 	// Pieces we have
-	have  Bitset
-	peers container.Set[*Peer]
+	have Bitset
 }
 
 type announce struct {
@@ -974,13 +974,14 @@ func (torr *Torrent) Stop() {
 
 	if torr.action != nil {
 		torr.action.Stop()
+
 	} else {
 		if torr.state != TorrentStateStopped {
 			torr.state = TorrentStateStopped
 
-			torr.mu.Lock()
+			torr.peersMu.Lock()
 			peers := container.CopyMap(torr.peers)
-			torr.mu.Unlock()
+			torr.peersMu.Unlock()
 
 			for peer := range peers {
 				peer.Close()
@@ -1090,10 +1091,17 @@ func (peer *Peer) updateStats() {
 	down := atomic.SwapUint64(&peer.statistics.downloaded, 0)
 
 	// XXX the tracker cares about data traffic, not raw traffic
-	peer.Torrent.stateMu.Lock()
-	peer.Torrent.trackerSession.up += up
-	peer.Torrent.trackerSession.down += down
-	peer.Torrent.stateMu.Unlock()
+	//
+	// We do not hold Torrent.stateMu here. updateStats cannot be
+	// called concurrently with Torrent.Start, because Torrent.Start's
+	// precondition implies that no peers exist. It can only be called
+	// concurrently with Torrent.Stop, which will wait for all
+	// still-running peers to stop before reading the torrent's stats.
+	//
+	// We do, however, have to use atomic operations, because multiple
+	// peers may be updating the same torrent's stats.
+	atomic.AddUint64(&peer.Torrent.trackerSession.up, up)
+	atomic.AddUint64(&peer.Torrent.trackerSession.down, down)
 
 	if up == 0 && down == 0 {
 		if peer.statistics.lastWasZero {
@@ -1114,9 +1122,13 @@ func (peer *Peer) updateStats() {
 		Down:  down,
 	}
 
-	peer.session.eventsMu.Lock()
-	peer.session.events = append(peer.session.events, ev)
-	peer.session.eventsMu.Unlock()
+	peer.session.addEvent(ev)
+}
+
+func (sess *Session) addEvent(ev Event) {
+	sess.eventsMu.Lock()
+	sess.events = append(sess.events, ev)
+	sess.eventsMu.Unlock()
 }
 
 type Error struct {
