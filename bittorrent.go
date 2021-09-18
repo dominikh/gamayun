@@ -92,15 +92,6 @@ func verifyBlock(data []byte, checksum []byte) bool {
 	return bytes.Equal(h[:], checksum)
 }
 
-type trackerAnnounceKind uint8
-
-const (
-	trackerAnnounceNone trackerAnnounceKind = iota
-	trackerAnnounceStarting
-	trackerAnnounceStopping
-	trackerAnnouncePeriodic
-)
-
 type trackerSession struct {
 	PeerID       [20]byte
 	nextAnnounce time.Time
