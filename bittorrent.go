@@ -247,7 +247,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		Hash:     hash,
 		have:     NewBitset(),
 		session:  sess,
-		peers:    container.NewSet[*Peer](),
+		peers:    container.NewConcurrentSet[*Peer](),
 	}
 
 	// XXX ensure the on-disk files are of the right lengths
@@ -563,14 +563,10 @@ func (sess *Session) runPeer(peer *Peer) error {
 	}
 	peerID := torr.trackerSession.PeerID
 	// Add to torr.peers while under the torr.statsMu lock so that Torrent.Stop doesn't miss any peers
-	torr.peersMu.Lock()
 	torr.peers.Add(peer)
-	torr.peersMu.Unlock()
 	torr.stateMu.Unlock()
 	defer func() {
 		// No need to hold torr.statsMu here, we're synchronized under Torrent.Stop waiting for runPeer to return
-		torr.peersMu.Lock()
-		defer torr.peersMu.Unlock()
 		torr.peers.Delete(peer)
 	}()
 
@@ -902,8 +898,7 @@ type Torrent struct {
 	state          TorrentState
 	action         Action
 	trackerSession trackerSession
-	peersMu        sync.Mutex
-	peers          container.Set[*Peer]
+	peers          container.ConcurrentSet[*Peer]
 
 	mu sync.RWMutex
 	// Pieces we have
@@ -979,9 +974,7 @@ func (torr *Torrent) Stop() {
 		if torr.state != TorrentStateStopped {
 			torr.state = TorrentStateStopped
 
-			torr.peersMu.Lock()
-			peers := container.CopyMap(torr.peers)
-			torr.peersMu.Unlock()
+			peers := torr.peers.Copy()
 
 			for peer := range peers {
 				peer.Close()
