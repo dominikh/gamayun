@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,7 +34,8 @@ type Settings struct {
 }
 
 type Session struct {
-	Settings Settings
+	Settings     Settings
+	PeerIDPrefix []byte
 
 	// XXX rename this field. these functions are only used for
 	// decision making, and are separate from events, which are
@@ -90,6 +92,9 @@ type Session struct {
 
 	eventsMu sync.Mutex
 	events   []Event
+
+	rngMu sync.Mutex
+	rng   *rand.Rand
 }
 
 func NewSession() *Session {
@@ -99,6 +104,7 @@ func NewSession() *Session {
 		peers:    container.NewSet[*Peer](),
 		closing:  make(chan struct{}),
 		done:     make(chan struct{}),
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -460,4 +466,22 @@ func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResp
 	}
 
 	return &tresp, nil
+}
+
+func (sess *Session) GeneratePeerID() [20]byte {
+	const minAscii = 33
+	const maxAscii = 127
+
+	var peerID [20]byte
+	copy(peerID[:], sess.PeerIDPrefix)
+	if len(sess.PeerIDPrefix) < 20 {
+		suffix := peerID[len(sess.PeerIDPrefix):]
+		sess.rngMu.Lock()
+		for i := range suffix {
+			suffix[i] = byte(sess.rng.Intn(maxAscii-minAscii) + minAscii)
+		}
+		sess.rngMu.Unlock()
+	}
+
+	return peerID
 }

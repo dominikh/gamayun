@@ -18,6 +18,7 @@ func main() {
 	// }()
 
 	client := bittorrent.NewSession()
+	client.PeerIDPrefix = []byte("GMY0001-")
 	client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
 		log.Println("New peer:", pconn)
 		return true

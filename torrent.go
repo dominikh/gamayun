@@ -57,8 +57,7 @@ func (torr *Torrent) Start() {
 	torr.trackerSession.nextAnnounce = time.Time{}
 	torr.trackerSession.up = 0
 	torr.trackerSession.down = 0
-	torr.trackerSession.PeerID = [20]byte{1, 2, 3, 4, 5, 6, 7, 8, 9}
-	// XXX generate peer ID
+	torr.trackerSession.PeerID = torr.session.GeneratePeerID()
 	torr.session.addAnnounce(announce{
 		infohash: torr.Hash,
 		tracker:  torr.Metainfo.Announce,
