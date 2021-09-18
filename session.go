@@ -75,6 +75,8 @@ type Session struct {
 		PeerDisconnected func(peer *Peer, err error)
 	}
 
+	done chan struct{}
+
 	closing  chan struct{}
 	mu       sync.RWMutex
 	listener net.Listener
@@ -96,6 +98,7 @@ func NewSession() *Session {
 		torrents: map[protocol.InfoHash]*Torrent{},
 		peers:    container.NewSet[*Peer](),
 		closing:  make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -286,6 +289,8 @@ func (sess *Session) listen() error {
 }
 
 func (sess *Session) Run() error {
+	defer close(sess.done)
+
 	errs := make(chan error, 1)
 	go func() {
 		errs <- sess.listen()
@@ -348,22 +353,17 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	}
 	log.Println("All peers done")
 
-	// It's okay if Session.Run hasn't returned yet; it clears
-	// Session.announces and there is no risk of an announce being
-	// processed more than once
+	// XXX ideally, our context would be able to cancel the announces that Session.Run is currently working on
+	//
+	// Wait for Session.Run to terminate
+	<-sess.done
+
+	// Process the remaining announces
 	anns := sess.getAnnounces()
 	for _, ann := range anns {
 		// XXX concurrency
-		sess.announce(context.Background(), ann)
+		sess.announce(ctx, ann)
 	}
-
-	// At this point it should be impossible for anyone to add new announces
-
-	// XXX allow ctx to cancel waiting
-	// sess.torrentsWg.Wait()
-	// log.Println("All torrents done")
-
-	// XXX flush outstanding announces
 
 	return nil
 }
