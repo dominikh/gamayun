@@ -369,6 +369,8 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 }
 
 func (sess *Session) addAnnounce(ann announce) {
+	ann.created = time.Now()
+	ann.nextTry = ann.created
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	sess.announces = append(sess.announces, ann)
@@ -385,8 +387,24 @@ func (sess *Session) addEvent(ev Event) {
 	sess.eventsMu.Unlock()
 }
 
-func (sess *Session) announce(ctx context.Context, ann announce) (*TrackerResponse, error) {
+func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResponse, err error) {
 	log.Printf("announcing %q for %s", ann.event, ann.infohash)
+
+	defer func() {
+		if err != nil {
+			ann.fails = append(ann.fails, struct {
+				when time.Time
+				err  error
+			}{time.Now(), err})
+			// XXX exponential backoff
+			//
+			// XXX cancel announce that has failed too often; remember
+			// to cancel all following announces that expect this
+			// announce to have gone through
+			ann.nextTry = time.Now().Add(10 * time.Second)
+		}
+		sess.addEvent(EventAnnounceFailed{ann})
+	}()
 
 	type AnnounceResponse struct {
 		Torrent  *Torrent
@@ -428,10 +446,15 @@ func (sess *Session) announce(ctx context.Context, ann announce) (*TrackerRespon
 	}
 	defer resp.Body.Close()
 
-	// XXX check status code of response
+	if cat := resp.StatusCode / 100; cat == 4 || cat == 5 {
+		// XXX return a typed error
+		// XXX include the response body in the error
+		return nil, fmt.Errorf("HTTP status %d", resp.StatusCode)
+	}
+
+	// XXX limit size of response body
 
 	var tresp TrackerResponse
-
 	if err := bencode.NewDecoder(resp.Body).Decode(&tresp); err != nil {
 		return nil, err
 	}

@@ -107,6 +107,13 @@ type announce struct {
 	up       uint64
 	down     uint64
 	// XXX left
+
+	created time.Time
+	fails   []struct {
+		when time.Time
+		err  error
+	}
+	nextTry time.Time
 }
 
 type Bitset struct {
