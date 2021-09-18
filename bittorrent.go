@@ -352,7 +352,7 @@ func (sess *Session) listen() error {
 
 			go func() {
 				defer close(peer.done)
-				err := sess.runPeer(peer)
+				err := peer.run()
 
 				sess.mu.Lock()
 				defer sess.mu.Unlock()
@@ -531,7 +531,7 @@ func (err CallbackRejectedPeerIDError) Error() string {
 	return fmt.Sprintf("peer wasn't allowed to connect with peer ID %q", err.PeerID)
 }
 
-func (sess *Session) runPeer(peer *Peer) error {
+func (peer *Peer) run() error {
 	defer peer.conn.Close()
 
 	// XXX add handshake and peer id to DownloadedTotal stat
@@ -540,15 +540,15 @@ func (sess *Session) runPeer(peer *Peer) error {
 		return err
 	}
 
-	if sess.Callbacks.PeerHandshakeInfoHash != nil {
-		if !sess.Callbacks.PeerHandshakeInfoHash(peer, hash) {
+	if peer.session.Callbacks.PeerHandshakeInfoHash != nil {
+		if !peer.session.Callbacks.PeerHandshakeInfoHash(peer, hash) {
 			return CallbackRejectedInfoHashError{hash}
 		}
 	}
 
-	sess.mu.RLock()
-	torr, ok := sess.torrents[hash]
-	sess.mu.RUnlock()
+	peer.session.mu.RLock()
+	torr, ok := peer.session.torrents[hash]
+	peer.session.mu.RUnlock()
 	if !ok {
 		return UnknownTorrentError{hash}
 	}
@@ -566,7 +566,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 	torr.peers.Add(peer)
 	torr.stateMu.Unlock()
 	defer func() {
-		// No need to hold torr.statsMu here, we're synchronized under Torrent.Stop waiting for runPeer to return
+		// No need to hold torr.statsMu here, we're synchronized under Torrent.Stop waiting for Peer.run to return
 		torr.peers.Delete(peer)
 	}()
 
@@ -581,8 +581,8 @@ func (sess *Session) runPeer(peer *Peer) error {
 		return err
 	}
 	peer.peerID = id
-	if sess.Callbacks.PeerHandshakePeerID != nil {
-		if !sess.Callbacks.PeerHandshakePeerID(peer, id) {
+	if peer.session.Callbacks.PeerHandshakePeerID != nil {
+		if !peer.session.Callbacks.PeerHandshakePeerID(peer, id) {
 			return CallbackRejectedPeerIDError{id}
 		}
 	}
@@ -591,7 +591,7 @@ func (sess *Session) runPeer(peer *Peer) error {
 	// OPT multiple reader goroutines?
 	//
 	// These goroutines will exit either when they encounter read/write errors on the connection or when Peer.done gets closed.
-	// This combination should ensure that the goroutines always terminate when runPeer returns.
+	// This combination should ensure that the goroutines always terminate when Peer.run returns.
 	go func() { channel.TrySend(errs, peer.blockReader()) }()
 	go func() { channel.TrySend(errs, peer.readPeer()) }()
 	go func() { channel.TrySend(errs, peer.writePeer()) }()
@@ -1067,7 +1067,7 @@ type Peer struct {
 	}
 }
 
-// Close closes the peer connection and waits for runPeer to return.
+// Close closes the peer connection and waits for Peer.run to return.
 func (peer *Peer) Close() {
 	peer.conn.Close()
 	<-peer.done
