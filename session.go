@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -25,12 +26,15 @@ var DefaultSettings = Settings{
 	NumConcurrentAnnounces: 10,
 	ListenAddress:          "0.0.0.0",
 	ListenPort:             "58261",
+	MaxSessionPeers:        -1,
 }
 
 type Settings struct {
 	NumConcurrentAnnounces int
 	ListenAddress          string
 	ListenPort             string // TODO support port ranges
+	// Session-wide maximum number of connected peers. -1 means unlimited
+	MaxSessionPeers int
 }
 
 type Session struct {
@@ -90,6 +94,9 @@ type Session struct {
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
+
+	// accessed atomically
+	numPeers uint64
 }
 
 func NewSession() *Session {
@@ -234,9 +241,20 @@ func (sess *Session) listen() error {
 			if err != nil {
 				return err
 			}
+
+			numPeers := atomic.AddUint64(&sess.numPeers, 1)
+			if sess.Settings.MaxSessionPeers >= 0 {
+				if numPeers > uint64(sess.Settings.MaxSessionPeers) {
+					atomic.AddUint64(&sess.numPeers, ^uint64(0))
+					conn.Close()
+					return nil
+				}
+			}
+
 			pconn := protocol.NewConnection(conn)
 			if sess.Callbacks.PeerIncoming != nil {
 				if !sess.Callbacks.PeerIncoming(pconn) {
+					atomic.AddUint64(&sess.numPeers, ^uint64(0))
 					pconn.Close()
 					return nil
 				}
@@ -246,6 +264,7 @@ func (sess *Session) listen() error {
 			defer sess.mu.Unlock()
 			if sess.isClosing() {
 				// We're shutting down, discard the connection and quit
+				atomic.AddUint64(&sess.numPeers, ^uint64(0))
 				pconn.Close()
 				return ErrClosing
 			}
@@ -276,6 +295,7 @@ func (sess *Session) listen() error {
 				sess.mu.Lock()
 				defer sess.mu.Unlock()
 				sess.peers.Delete(peer)
+				atomic.AddUint64(&sess.numPeers, ^uint64(0))
 				if sess.Callbacks.PeerDisconnected != nil {
 					sess.Callbacks.PeerDisconnected(peer, err)
 				}
