@@ -132,6 +132,7 @@ func (peer *Peer) readPeer() error {
 	for {
 		select {
 		case msg := <-msgs:
+			atomic.AddUint64(&peer.session.statistics.downloadedRaw, uint64(msg.Size()))
 			atomic.AddUint64(&peer.statistics.downloaded, uint64(msg.Size()))
 			select {
 			case peer.msgs <- msg:
@@ -148,6 +149,7 @@ func (peer *Peer) readPeer() error {
 
 func (peer *Peer) writePeer() error {
 	writeMsg := func(msg protocol.Message) error {
+		atomic.AddUint64(&peer.session.statistics.uploadedRaw, uint64(msg.Size()))
 		atomic.AddUint64(&peer.statistics.uploaded, uint64(msg.Size()))
 		return peer.conn.WriteMessage(msg)
 	}
@@ -187,6 +189,7 @@ func (peer *Peer) run() error {
 
 	if peer.session.Callbacks.PeerHandshakeInfoHash != nil {
 		if !peer.session.Callbacks.PeerHandshakeInfoHash(peer, hash) {
+			atomic.AddUint64(&peer.session.statistics.numRejectedPeers.peerHandshakeInfoHashCallback, 1)
 			return CallbackRejectedInfoHashError{hash}
 		}
 	}
@@ -195,6 +198,7 @@ func (peer *Peer) run() error {
 	torr, ok := peer.session.torrents[hash]
 	peer.session.mu.RUnlock()
 	if !ok {
+		atomic.AddUint64(&peer.session.statistics.numRejectedPeers.unknownTorrent, 1)
 		return UnknownTorrentError{hash}
 	}
 
@@ -204,6 +208,7 @@ func (peer *Peer) run() error {
 	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
 		torr.stateMu.Unlock()
+		atomic.AddUint64(&peer.session.statistics.numRejectedPeers.stoppedTorrent, 1)
 		return StoppedTorrentError{hash}
 	}
 	peerID := torr.trackerSession.PeerID

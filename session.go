@@ -22,6 +22,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
+// OPT investigate if we should batch prometheus updates to reduce congestion.
+
 var DefaultSettings = Settings{
 	NumConcurrentAnnounces: 10,
 	ListenAddress:          "0.0.0.0",
@@ -95,8 +97,27 @@ type Session struct {
 	rngMu sync.Mutex
 	rng   *rand.Rand
 
+	// XXX check alignment on 32-bit
 	// accessed atomically
-	numPeers uint64
+	statistics struct {
+		numConnectedPeers uint64
+		uploadedRaw       uint64
+		downloadedRaw     uint64
+		numRejectedPeers  struct {
+			sessionLimit                  uint64
+			peerIncomingCallback          uint64
+			peerHandshakeInfoHashCallback uint64
+			shutdown                      uint64
+			unknownTorrent                uint64
+			stoppedTorrent                uint64
+		}
+		numTorrents struct {
+			stopped  uint64
+			leeching uint64
+			seeding  uint64
+			action   uint64
+		}
+	}
 }
 
 func NewSession() *Session {
@@ -213,6 +234,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		// Don't add new torrent to an already stopped client
 		return nil, ErrClosing
 	}
+	atomic.AddUint64(&sess.statistics.numTorrents.stopped, 1)
 	sess.torrents[torr.Hash] = torr
 
 	return torr, nil
@@ -242,10 +264,11 @@ func (sess *Session) listen() error {
 				return err
 			}
 
-			numPeers := atomic.AddUint64(&sess.numPeers, 1)
+			numPeers := atomic.AddUint64(&sess.statistics.numConnectedPeers, 1)
 			if sess.Settings.MaxSessionPeers >= 0 {
 				if numPeers > uint64(sess.Settings.MaxSessionPeers) {
-					atomic.AddUint64(&sess.numPeers, ^uint64(0))
+					atomic.AddUint64(&sess.statistics.numRejectedPeers.sessionLimit, 1)
+					atomic.AddUint64(&sess.statistics.numConnectedPeers, ^uint64(0))
 					conn.Close()
 					return nil
 				}
@@ -254,7 +277,8 @@ func (sess *Session) listen() error {
 			pconn := protocol.NewConnection(conn)
 			if sess.Callbacks.PeerIncoming != nil {
 				if !sess.Callbacks.PeerIncoming(pconn) {
-					atomic.AddUint64(&sess.numPeers, ^uint64(0))
+					atomic.AddUint64(&sess.statistics.numRejectedPeers.peerIncomingCallback, 1)
+					atomic.AddUint64(&sess.statistics.numConnectedPeers, ^uint64(0))
 					pconn.Close()
 					return nil
 				}
@@ -264,7 +288,8 @@ func (sess *Session) listen() error {
 			defer sess.mu.Unlock()
 			if sess.isClosing() {
 				// We're shutting down, discard the connection and quit
-				atomic.AddUint64(&sess.numPeers, ^uint64(0))
+				atomic.AddUint64(&sess.statistics.numRejectedPeers.shutdown, 1)
+				atomic.AddUint64(&sess.statistics.numConnectedPeers, ^uint64(0))
 				pconn.Close()
 				return ErrClosing
 			}
@@ -295,7 +320,7 @@ func (sess *Session) listen() error {
 				sess.mu.Lock()
 				defer sess.mu.Unlock()
 				sess.peers.Delete(peer)
-				atomic.AddUint64(&sess.numPeers, ^uint64(0))
+				atomic.AddUint64(&sess.statistics.numConnectedPeers, ^uint64(0))
 				if sess.Callbacks.PeerDisconnected != nil {
 					sess.Callbacks.PeerDisconnected(peer, err)
 				}

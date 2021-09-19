@@ -2,6 +2,7 @@ package bittorrent
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/container"
@@ -111,11 +112,30 @@ func (torr *Torrent) Start() {
 	})
 
 	if torr.IsComplete() {
-		torr.state = TorrentStateSeeding
+		torr.setState(TorrentStateSeeding)
 	} else {
-		torr.state = TorrentStateLeeching
+		torr.setState(TorrentStateLeeching)
 		panic("XXX: we cannot download torrents yet")
 	}
+}
+
+func (torr *Torrent) updatePrometheusState(state TorrentState, delta uint64) {
+	switch state {
+	case TorrentStateLeeching:
+		atomic.AddUint64(&torr.session.statistics.numTorrents.leeching, delta)
+	case TorrentStateSeeding:
+		atomic.AddUint64(&torr.session.statistics.numTorrents.seeding, delta)
+	case TorrentStateStopped:
+		atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, delta)
+	default:
+		panic("unhandled state")
+	}
+}
+
+func (torr *Torrent) setState(state TorrentState) {
+	torr.updatePrometheusState(torr.state, ^uint64(0))
+	torr.updatePrometheusState(state, 1)
+	torr.state = state
 }
 
 func (torr *Torrent) Stop() {
@@ -127,7 +147,7 @@ func (torr *Torrent) Stop() {
 
 	} else {
 		if torr.state != TorrentStateStopped {
-			torr.state = TorrentStateStopped
+			torr.setState(TorrentStateStopped)
 
 			peers := torr.peers.Copy()
 
@@ -178,10 +198,17 @@ func (torr *Torrent) NumPieces() int {
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 	torr.Stop()
+
+	atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, ^uint64(0))
+	atomic.AddUint64(&torr.session.statistics.numTorrents.action, 1)
+
 	// XXX guard against a concurrent call to Start
 	torr.action = l
 	res, stopped, err := torr.action.Run()
 	torr.action = nil
+
+	atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, 1)
+	atomic.AddUint64(&torr.session.statistics.numTorrents.action, ^uint64(0))
 
 	return res, stopped, err
 }

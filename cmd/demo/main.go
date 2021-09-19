@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"honnef.co/go/bittorrent"
 	"honnef.co/go/bittorrent/protocol"
 )
@@ -17,7 +20,14 @@ func main() {
 	// 	log.Println(http.ListenAndServe("localhost:6060", nil))
 	// }()
 
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		http.ListenAndServe(":2112", nil)
+	}()
+
 	client := bittorrent.NewSession()
+	prometheus.DefaultRegisterer.MustRegister(client)
+
 	client.PeerIDPrefix = []byte("GMY0001-")
 	client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
 		log.Println("New peer:", pconn)
