@@ -301,11 +301,18 @@ func (sess *Session) Run() error {
 	for {
 		select {
 		// XXX don't depend on a timer for processing announces
-		case <-t.C:
+		case now := <-t.C:
 			// OPT don't iterate over all torrents, instead keep a list of torrents with outstanding announces
 			sess.mu.Lock()
 			for _, torr := range sess.torrents {
-				for _, ann := range torr.getAnnounces() {
+				anns := torr.getAnnounces()
+				if len(anns) == 0 {
+					continue
+				}
+				if anns[0].NextTry.After(now) {
+					continue
+				}
+				for _, ann := range anns {
 					// XXX concurrency
 					// XXX handle error
 					sess.announce(context.Background(), ann)
@@ -353,6 +360,8 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	<-sess.done
 
 	// Process the remaining announces
+	//
+	// XXX respect backoff of failed announces
 	for _, torr := range sess.torrents {
 		anns := torr.getAnnounces()
 		for _, ann := range anns {
