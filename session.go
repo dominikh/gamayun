@@ -399,8 +399,8 @@ func (sess *Session) announce(ctx context.Context, ann Announce) (_ *TrackerResp
 			// to cancel all following announces that expect this
 			// announce to have gone through
 			ann.NextTry = time.Now().Add(10 * time.Second)
+			sess.addEvent(EventAnnounceFailed{ann})
 		}
-		sess.addEvent(EventAnnounceFailed{ann})
 	}()
 
 	type AnnounceResponse struct {
