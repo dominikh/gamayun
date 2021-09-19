@@ -43,8 +43,6 @@ func (cset *ConcurrentSet[T]) Copy() Set[T] {
 	return CopyMap(cset.set)
 }
 
-// ---
-
 type Set[T comparable] map[T]struct{}
 
 func NewSet[T comparable]() Set[T] {

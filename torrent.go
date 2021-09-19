@@ -8,6 +8,44 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 )
 
+type announceQueue[T any] struct {
+	mu   sync.Mutex
+	data []T
+}
+
+func (q *announceQueue[T]) Push(el T) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.data = append(q.data, el)
+}
+
+func (q *announceQueue[T]) Pop() (T, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var zero T
+	if len(q.data) == 0 {
+		return zero, false
+	}
+	el := q.data[0]
+	copy(q.data, q.data[1:])
+	q.data = q.data[:len(q.data)-1]
+	return el, true
+}
+
+func (q *announceQueue[T]) Peek() (T, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var zero T
+	if len(q.data) == 0 {
+		return zero, false
+	}
+	return q.data[0], true
+}
+
+func (q *announceQueue[T]) ReplaceFront(el T) {
+	q.data[0] = el
+}
+
 //go:generate go run golang.org/x/tools/cmd/stringer@master -type TorrentState
 type TorrentState uint8
 
@@ -24,6 +62,7 @@ type Torrent struct {
 	availability Pieces
 	data         *dataStorage
 	session      *Session
+	announces    announceQueue[Announce]
 
 	// Mutex used to prevent concurrent Start and Stop calls
 	stateMu        sync.Mutex
@@ -34,25 +73,13 @@ type Torrent struct {
 
 	mu sync.RWMutex
 	// Pieces we have
-	have      Bitset
-	announces []Announce
-}
-
-// getAnnounces empties the list of outstanding announces and returns it
-func (torr *Torrent) getAnnounces() []Announce {
-	torr.mu.Lock()
-	defer torr.mu.Unlock()
-	out := torr.announces
-	torr.announces = nil
-	return out
+	have Bitset
 }
 
 func (torr *Torrent) addAnnounce(ann Announce) {
 	ann.Created = time.Now()
 	ann.NextTry = ann.Created
-	torr.mu.Lock()
-	defer torr.mu.Unlock()
-	torr.announces = append(torr.announces, ann)
+	torr.announces.Push(ann)
 }
 
 func (torr *Torrent) Start() {

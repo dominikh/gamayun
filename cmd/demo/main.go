@@ -99,7 +99,7 @@ func main() {
 				traffic[ev.Peer.Torrent] = tr
 			case bittorrent.EventAnnounceFailed:
 				log.Printf("announce for %s failed for the %dth time; reason: %s",
-					ev.Announce.InfoHash, len(ev.Announce.Fails), ev.Announce.Fails[len(ev.Announce.Fails)-1])
+					ev.Announce.InfoHash, len(ev.Announce.Fails), ev.Announce.Fails[len(ev.Announce.Fails)-1].Err)
 			default:
 				log.Printf("unhandled event: %v", ev)
 			}

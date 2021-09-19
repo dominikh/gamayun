@@ -305,17 +305,21 @@ func (sess *Session) Run() error {
 			// OPT don't iterate over all torrents, instead keep a list of torrents with outstanding announces
 			sess.mu.Lock()
 			for _, torr := range sess.torrents {
-				anns := torr.getAnnounces()
-				if len(anns) == 0 {
-					continue
-				}
-				if anns[0].NextTry.After(now) {
-					continue
-				}
-				for _, ann := range anns {
+				for {
+					ann, ok := torr.announces.Peek()
+					if !ok {
+						break
+					}
+					if ann.NextTry.After(now) {
+						break
+					}
 					// XXX concurrency
-					// XXX handle error
-					sess.announce(context.Background(), ann)
+					_, err := sess.announce(context.Background(), &ann)
+					if err != nil {
+						torr.announces.ReplaceFront(ann)
+						break
+					}
+					torr.announces.Pop()
 				}
 			}
 			sess.mu.Unlock()
@@ -363,10 +367,14 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	//
 	// XXX respect backoff of failed announces
 	for _, torr := range sess.torrents {
-		anns := torr.getAnnounces()
-		for _, ann := range anns {
+		for {
+			ann, ok := torr.announces.Pop()
+			if !ok {
+				break
+			}
+			// XXX handle failure
 			// XXX concurrency
-			sess.announce(ctx, ann)
+			sess.announce(ctx, &ann)
 		}
 	}
 
@@ -384,7 +392,7 @@ func (sess *Session) addEvent(ev Event) {
 	sess.eventsMu.Unlock()
 }
 
-func (sess *Session) announce(ctx context.Context, ann Announce) (_ *TrackerResponse, err error) {
+func (sess *Session) announce(ctx context.Context, ann *Announce) (_ *TrackerResponse, err error) {
 	log.Printf("announcing %q for %s", ann.Event, ann.InfoHash)
 
 	defer func() {
@@ -399,7 +407,7 @@ func (sess *Session) announce(ctx context.Context, ann Announce) (_ *TrackerResp
 			// to cancel all following announces that expect this
 			// announce to have gone through
 			ann.NextTry = time.Now().Add(10 * time.Second)
-			sess.addEvent(EventAnnounceFailed{ann})
+			sess.addEvent(EventAnnounceFailed{*ann})
 		}
 	}()
 
