@@ -416,7 +416,12 @@ func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResp
 	// XXX support multi-file mode
 	// q["left"] = []string{strconv.FormatUint(areq.Torrent.Metainfo.Info.Length, 10)}
 	q["left"] = []string{"0"} // XXX use correct value
-	q["numwant"] = []string{"200"}
+
+	if ann.event == "stopped" {
+		q["numwant"] = []string{"0"}
+	} else {
+		q["numwant"] = []string{"200"}
+	}
 	q["compact"] = []string{"1"}
 	q["no_peer_id"] = []string{"1"}
 	if ann.event != "" {
