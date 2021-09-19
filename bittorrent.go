@@ -99,21 +99,21 @@ type trackerSession struct {
 	down         uint64
 }
 
-type announce struct {
-	infohash protocol.InfoHash
-	tracker  string
-	peerID   [20]byte
-	event    string
-	up       uint64
-	down     uint64
+type Announce struct {
+	InfoHash protocol.InfoHash
+	Tracker  string
+	PeerID   [20]byte
+	Event    string
+	Up       uint64
+	Down     uint64
 	// XXX left
 
-	created time.Time
-	fails   []struct {
-		when time.Time
-		err  error
+	Created time.Time
+	Fails   []struct {
+		When time.Time
+		Err  error
 	}
-	nextTry time.Time
+	NextTry time.Time
 }
 
 type Bitset struct {

@@ -25,5 +25,5 @@ type EventPeerDisconnected struct {
 }
 
 type EventAnnounceFailed struct {
-	Announce announce
+	Announce Announce
 }

@@ -375,21 +375,21 @@ func (sess *Session) addEvent(ev Event) {
 	sess.eventsMu.Unlock()
 }
 
-func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResponse, err error) {
-	log.Printf("announcing %q for %s", ann.event, ann.infohash)
+func (sess *Session) announce(ctx context.Context, ann Announce) (_ *TrackerResponse, err error) {
+	log.Printf("announcing %q for %s", ann.Event, ann.InfoHash)
 
 	defer func() {
 		if err != nil {
-			ann.fails = append(ann.fails, struct {
-				when time.Time
-				err  error
+			ann.Fails = append(ann.Fails, struct {
+				When time.Time
+				Err  error
 			}{time.Now(), err})
 			// XXX exponential backoff
 			//
 			// XXX cancel announce that has failed too often; remember
 			// to cancel all following announces that expect this
 			// announce to have gone through
-			ann.nextTry = time.Now().Add(10 * time.Second)
+			ann.NextTry = time.Now().Add(10 * time.Second)
 		}
 		sess.addEvent(EventAnnounceFailed{ann})
 	}()
@@ -399,7 +399,7 @@ func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResp
 		Response TrackerResponse
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ann.tracker, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ann.Tracker, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -408,24 +408,24 @@ func (sess *Session) announce(ctx context.Context, ann announce) (_ *TrackerResp
 
 	q := req.URL.Query()
 	// XXX remove once we support BEP 23
-	q["info_hash"] = []string{string(ann.infohash[:])}
-	q["peer_id"] = []string{string(ann.peerID[:])}
+	q["info_hash"] = []string{string(ann.InfoHash[:])}
+	q["peer_id"] = []string{string(ann.PeerID[:])}
 	q["port"] = []string{sess.Settings.ListenPort}
-	q["uploaded"] = []string{strconv.FormatUint(ann.up, 10)}
-	q["downloaded"] = []string{strconv.FormatUint(ann.down, 10)}
+	q["uploaded"] = []string{strconv.FormatUint(ann.Up, 10)}
+	q["downloaded"] = []string{strconv.FormatUint(ann.Down, 10)}
 	// XXX support multi-file mode
 	// q["left"] = []string{strconv.FormatUint(areq.Torrent.Metainfo.Info.Length, 10)}
 	q["left"] = []string{"0"} // XXX use correct value
 
-	if ann.event == "stopped" {
+	if ann.Event == "stopped" {
 		q["numwant"] = []string{"0"}
 	} else {
 		q["numwant"] = []string{"200"}
 	}
 	q["compact"] = []string{"1"}
 	q["no_peer_id"] = []string{"1"}
-	if ann.event != "" {
-		q["event"] = []string{ann.event}
+	if ann.Event != "" {
+		q["event"] = []string{ann.Event}
 	}
 
 	// Replace "+" with "%20" in encoded info hash. net/url thinks
