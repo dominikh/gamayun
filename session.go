@@ -84,11 +84,6 @@ type Session struct {
 	listener net.Listener
 	torrents map[protocol.InfoHash]*Torrent
 	peers    container.Set[*Peer]
-	// XXX we can't keep all announces in one slice. if one announce
-	// for a torrent fails, then we must postpone all its other
-	// announces, too. which means we want a list of announces per
-	// torrent.
-	announces []announce
 
 	eventsMu sync.Mutex
 	events   []Event
@@ -307,10 +302,16 @@ func (sess *Session) Run() error {
 		select {
 		// XXX don't depend on a timer for processing announces
 		case <-t.C:
-			for _, ann := range sess.getAnnounces() {
-				// XXX concurrency
-				sess.announce(context.Background(), ann)
+			// OPT don't iterate over all torrents, instead keep a list of torrents with outstanding announces
+			sess.mu.Lock()
+			for _, torr := range sess.torrents {
+				for _, ann := range torr.getAnnounces() {
+					// XXX concurrency
+					// XXX handle error
+					sess.announce(context.Background(), ann)
+				}
 			}
+			sess.mu.Unlock()
 		case err := <-errs:
 			// XXX make sure Shutdown works through all the remaining announces
 			return err
@@ -318,19 +319,6 @@ func (sess *Session) Run() error {
 	}
 
 	// XXX periodically announce torrents, choke/unchoke peers, ...
-}
-
-// getAnnounces empties the list of outstanding announces and returns it
-func (sess *Session) getAnnounces() []announce {
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	return sess.getAnnouncesLocked()
-}
-
-func (sess *Session) getAnnouncesLocked() []announce {
-	out := sess.announces
-	sess.announces = nil
-	return out
 }
 
 func (sess *Session) Shutdown(ctx context.Context) error {
@@ -365,21 +353,15 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	<-sess.done
 
 	// Process the remaining announces
-	anns := sess.getAnnounces()
-	for _, ann := range anns {
-		// XXX concurrency
-		sess.announce(ctx, ann)
+	for _, torr := range sess.torrents {
+		anns := torr.getAnnounces()
+		for _, ann := range anns {
+			// XXX concurrency
+			sess.announce(ctx, ann)
+		}
 	}
 
 	return nil
-}
-
-func (sess *Session) addAnnounce(ann announce) {
-	ann.created = time.Now()
-	ann.nextTry = ann.created
-	sess.mu.Lock()
-	defer sess.mu.Unlock()
-	sess.announces = append(sess.announces, ann)
 }
 
 func (sess *Session) isClosing() bool {

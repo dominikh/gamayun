@@ -34,7 +34,25 @@ type Torrent struct {
 
 	mu sync.RWMutex
 	// Pieces we have
-	have Bitset
+	have      Bitset
+	announces []announce
+}
+
+// getAnnounces empties the list of outstanding announces and returns it
+func (torr *Torrent) getAnnounces() []announce {
+	torr.mu.Lock()
+	defer torr.mu.Unlock()
+	out := torr.announces
+	torr.announces = nil
+	return out
+}
+
+func (torr *Torrent) addAnnounce(ann announce) {
+	ann.created = time.Now()
+	ann.nextTry = ann.created
+	torr.mu.Lock()
+	defer torr.mu.Unlock()
+	torr.announces = append(torr.announces, ann)
 }
 
 func (torr *Torrent) Start() {
@@ -58,7 +76,7 @@ func (torr *Torrent) Start() {
 	torr.trackerSession.up = 0
 	torr.trackerSession.down = 0
 	torr.trackerSession.PeerID = torr.session.GeneratePeerID()
-	torr.session.addAnnounce(announce{
+	torr.addAnnounce(announce{
 		infohash: torr.Hash,
 		tracker:  torr.Metainfo.Announce,
 		peerID:   torr.trackerSession.PeerID,
@@ -90,7 +108,7 @@ func (torr *Torrent) Stop() {
 				peer.Close()
 			}
 
-			torr.session.addAnnounce(announce{
+			torr.addAnnounce(announce{
 				infohash: torr.Hash,
 				peerID:   torr.trackerSession.PeerID,
 				event:    "stopped",
