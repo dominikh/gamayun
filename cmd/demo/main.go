@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	_ "sync" // work around compiler bug
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
