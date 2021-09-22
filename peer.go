@@ -213,11 +213,11 @@ func (peer *Peer) run() error {
 	}
 	peerID := torr.trackerSession.PeerID
 	// Add to torr.peers while under the torr.statsMu lock so that Torrent.Stop doesn't miss any peers
-	torr.peers.Add(peer)
+	torr.addPeer(peer)
 	torr.stateMu.Unlock()
 	defer func() {
 		// No need to hold torr.statsMu here, we're synchronized under Torrent.Stop waiting for Peer.run to return
-		torr.peers.Delete(peer)
+		torr.removePeer(peer)
 	}()
 
 	peer.Torrent = torr

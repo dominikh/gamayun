@@ -97,6 +97,8 @@ type Session struct {
 	rngMu sync.Mutex
 	rng   *rand.Rand
 
+	torrentsWithPeers container.ConcurrentSet[*Torrent]
+
 	// XXX check alignment on 32-bit
 	// accessed atomically
 	statistics struct {
@@ -122,12 +124,13 @@ type Session struct {
 
 func NewSession() *Session {
 	return &Session{
-		Settings: DefaultSettings,
-		torrents: map[protocol.InfoHash]*Torrent{},
-		peers:    container.NewSet[*Peer](),
-		closing:  make(chan struct{}),
-		done:     make(chan struct{}),
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		Settings:          DefaultSettings,
+		torrents:          map[protocol.InfoHash]*Torrent{},
+		peers:             container.NewSet[*Peer](),
+		closing:           make(chan struct{}),
+		done:              make(chan struct{}),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
+		torrentsWithPeers: container.NewConcurrentSet[*Torrent](),
 	}
 }
 

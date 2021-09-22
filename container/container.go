@@ -13,13 +13,15 @@ func NewConcurrentSet[T comparable]() ConcurrentSet[T] {
 	}
 }
 
-func (cset *ConcurrentSet[T]) Add(k T) bool {
+// Add adds element k to the set and returns whether the element was
+// new, and the new length of the set.
+func (cset *ConcurrentSet[T]) Add(k T) (bool, int) {
 	cset.mu.Lock()
 	defer cset.mu.Unlock()
 
 	_, ok := cset.set[k]
 	cset.set[k] = struct{}{}
-	return !ok
+	return !ok, len(cset.set)
 }
 
 func (cset *ConcurrentSet[T]) Has(k T) bool {
@@ -30,11 +32,13 @@ func (cset *ConcurrentSet[T]) Has(k T) bool {
 	return ok
 }
 
-func (cset *ConcurrentSet[T]) Delete(k T) {
+// Delete deletes element k and returns the new length of the set.
+func (cset *ConcurrentSet[T]) Delete(k T) int {
 	cset.mu.Lock()
 	defer cset.mu.Unlock()
 
 	delete(cset.set, k)
+	return len(cset.set)
 }
 
 func (cset *ConcurrentSet[T]) Copy() Set[T] {

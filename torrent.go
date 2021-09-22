@@ -77,6 +77,17 @@ type Torrent struct {
 	have Bitset
 }
 
+func (torr *Torrent) addPeer(peer *Peer) {
+	torr.peers.Add(peer)
+	torr.session.torrentsWithPeers.Add(torr)
+}
+
+func (torr *Torrent) removePeer(peer *Peer) {
+	if torr.peers.Delete(peer) == 0 {
+		torr.session.torrentsWithPeers.Delete(torr)
+	}
+}
+
 func (torr *Torrent) addAnnounce(ann Announce) {
 	ann.Created = time.Now()
 	ann.NextTry = ann.Created
