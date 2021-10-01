@@ -221,10 +221,10 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 
 	n := uint32(torr.NumPieces())
 	torr.availability = Pieces{
-		pieceIndices: make([]uint32, n),
-		sortedPieces: make([]uint32, n),
-		priorities:   make([]uint16, n),
-		buckets:      []uint32{n},
+		pieceIndices:   make([]uint32, n),
+		sortedPieces:   make([]uint32, n),
+		availabilities: make([]uint16, n),
+		buckets:        []uint32{n},
 	}
 	for i := uint32(0); i < n; i++ {
 		torr.availability.pieceIndices[i] = i

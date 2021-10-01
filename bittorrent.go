@@ -78,6 +78,9 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 )
 
+// The maximum number of peers per torrent the code supports.
+const maxPeersPerTorrent = 65535
+
 // How often each peer updates the global and per-torrent traffic statistics.
 const peerStatisticsInterval = 500 * time.Millisecond
 
@@ -214,31 +217,35 @@ type Pieces struct {
 	// sorted list of pieces, indexed into by piece_indices
 	sortedPieces []uint32
 
-	// mapping from piece to priority
-	priorities []uint16 // supports at most 65536 peers
+	// mapping from piece to availability
+	availabilities []uint16 // supports at most 65536 peers
 
 	// mapping from priority to one past the last item in sorted_pieces that is part of that priority
 	buckets []uint32
 
-	// Mapping from piece to status
-	downloading big.Int // OPT don't use big.Int, it wastes a byte (+padding) on the sign
-
-	// Mapping from piece to block bitmap
-	blockBitmapPtrs []uint16 // supports at most 65536 actively downloading pieces
-	// Mapping from block bitmap pointer to block bitmap
-	blockBitmaps []*big.Int
-
-	// Number of peers that have all pieces. These aren't tracked in Priorities.
+	// Number of peers that have all pieces. These aren't tracked in availabilities.
 	haveAll int
+}
+
+func (t *Pieces) incAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.haveAll++
+}
+
+func (t *Pieces) decAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.haveAll--
 }
 
 func (t *Pieces) inc(piece uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	avail := t.priorities[piece]
+	avail := t.availabilities[piece]
 	t.buckets[avail]--
-	t.priorities[piece]++
+	t.availabilities[piece]++
 
 	index := t.pieceIndices[piece]
 	other_index := t.buckets[avail]
@@ -256,8 +263,8 @@ func (t *Pieces) dec(piece uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	t.priorities[piece]--
-	avail := t.priorities[piece]
+	t.availabilities[piece]--
+	avail := t.availabilities[piece]
 
 	index := t.pieceIndices[piece]
 	other_index := t.buckets[avail]

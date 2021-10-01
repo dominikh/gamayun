@@ -284,10 +284,22 @@ func (peer *Peer) run() error {
 		// XXX implement sending bitfield. don't forget to remove '|| true' from the previous condition
 	}
 
-	trafficTicker := time.NewTicker(peerStatisticsInterval)
-	t := time.NewTicker(time.Second)
+	// Decrement availability of all pieces this peer had. Gets used
+	// if the first message was HaveNone or Bitfield. HaveAll instead
+	// increments the "haveAll" offset.
+	decrementAvailability := func() {
+		bits := peer.have.bits
+		n := bits.BitLen()
+		for i := 0; i < n; i++ {
+			if bits.Bit(n) != 0 {
+				peer.Torrent.availability.dec(uint32(n))
+			}
+		}
+	}
 
 	defer peer.updateStats()
+	trafficTicker := time.NewTicker(peerStatisticsInterval)
+	t := time.NewTicker(time.Second)
 	for {
 		select {
 		case err := <-errs:
@@ -307,7 +319,7 @@ func (peer *Peer) run() error {
 					return err
 				}
 			} else if peer.peerInterested && peer.amChoking {
-				// XXX limit number of unchoked peers
+				// XXX limit number of unchoked peers (at which point we need to loop over all peers twice; first to choke, then to unchoke)
 				peer.amChoking = false
 				err := peer.controlWrite(protocol.Message{
 					Type: protocol.MessageTypeUnchoke,
@@ -333,7 +345,6 @@ func (peer *Peer) run() error {
 			if !peer.setup {
 				switch msg.Type {
 				case protocol.MessageTypeBitfield:
-					t := time.Now()
 					// XXX verify length and shape of bitfield
 					peer.have.SetBitfield(msg.Data)
 					bit := 0
@@ -345,17 +356,18 @@ func (peer *Peer) run() error {
 							}
 						}
 					}
-					fmt.Println(time.Since(t))
-					// XXX decrement when peer disconnects
+
+					// Decrement availability of all pieces this peer had
+					defer decrementAvailability()
 				case protocol.MessageTypeHaveNone:
-					// nothing to do
+					defer decrementAvailability()
 				case protocol.MessageTypeHaveAll:
 					// OPT more efficient representation for HaveAll
 					for i := 0; i < peer.Torrent.NumPieces(); i++ {
 						peer.have.Set(uint32(i))
 					}
-					// XXX decrement when peer disconnects
-					peer.Torrent.availability.haveAll++
+					peer.Torrent.availability.incAll()
+					defer peer.Torrent.availability.decAll()
 				default:
 					// XXX instead of panicing we should kill the peer for a protocol violation
 					panic(fmt.Sprintf("unexpected message %s", msg))
@@ -401,9 +413,8 @@ func (peer *Peer) run() error {
 					peer.peerInterested = false
 				case protocol.MessageTypeHave:
 					// XXX check bounds
-					// XXX ignore Have if we've gotten HaveAll before
+					// XXX ignore Have if we've gotten HaveAll before (or is it a protocol violation?)
 					peer.have.Set(msg.Index)
-					// XXX decrement when peer disconnects
 					peer.Torrent.availability.inc(msg.Index)
 				case protocol.MessageTypeChoke:
 					// XXX handle
