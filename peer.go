@@ -2,6 +2,8 @@ package bittorrent
 
 import (
 	"fmt"
+	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,15 +34,16 @@ type Peer struct {
 	peerID [20]byte
 	have   Bitset
 	// The peer has sent one of the allowed initial messages
-	setup          bool
-	amChoking      bool
-	amInterested   bool
-	peerChoking    bool
-	peerInterested bool
-	lastHaveSent   Bitset
-	Torrent        *Torrent // XXX make sure this doesn't need locking, now that it is exported
+	setup        bool
+	amInterested bool
+	peerChoking  bool
+	lastHaveSent Bitset
+	Torrent      *Torrent // XXX make sure this doesn't need locking, now that it is exported
 
 	// mutable, needs lock held
+	mu             sync.RWMutex
+	amChoking      bool
+	peerInterested bool
 
 	// accessed atomically
 	droppedRequests uint32
@@ -309,26 +312,6 @@ func (peer *Peer) run() error {
 		case <-trafficTicker.C:
 			peer.updateStats()
 		case <-t.C:
-			// XXX move choking/unchoking to the session goroutine
-			if !peer.peerInterested && !peer.amChoking {
-				peer.amChoking = true
-				err := peer.controlWrite(protocol.Message{
-					Type: protocol.MessageTypeChoke,
-				})
-				if err != nil {
-					return err
-				}
-			} else if peer.peerInterested && peer.amChoking {
-				// XXX limit number of unchoked peers (at which point we need to loop over all peers twice; first to choke, then to unchoke)
-				peer.amChoking = false
-				err := peer.controlWrite(protocol.Message{
-					Type: protocol.MessageTypeUnchoke,
-				})
-				if err != nil {
-					return err
-				}
-			}
-
 			torr := peer.Torrent
 			torr.mu.RLock()
 			if torr.have.count != peer.lastHaveSent.count {
@@ -379,7 +362,10 @@ func (peer *Peer) run() error {
 					// XXX respect cancel messages
 					// XXX verify that index, begin and length are in bounds
 					// XXX reject if we don't have the piece
-					if peer.amChoking {
+					peer.mu.RLock()
+					amChoking := peer.amChoking
+					peer.mu.RUnlock()
+					if amChoking {
 						err := peer.controlWrite(protocol.Message{
 							Type:   protocol.MessageTypeRejectRequest,
 							Index:  msg.Index,
@@ -408,9 +394,13 @@ func (peer *Peer) run() error {
 						}
 					}
 				case protocol.MessageTypeInterested:
+					peer.mu.Lock()
 					peer.peerInterested = true
+					peer.mu.Unlock()
 				case protocol.MessageTypeNotInterested:
+					peer.mu.Lock()
 					peer.peerInterested = false
+					peer.mu.Unlock()
 				case protocol.MessageTypeHave:
 					// XXX check bounds
 					// XXX ignore Have if we've gotten HaveAll before (or is it a protocol violation?)
@@ -436,6 +426,38 @@ func (peer *Peer) run() error {
 			}
 		}
 	}
+}
+
+func (peer *Peer) choke() error {
+	log.Println("choking", peer)
+
+	// XXX don't block trying to send the control message to a slow peer
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.amChoking {
+		return nil
+	}
+	peer.amChoking = true
+
+	return peer.controlWrite(protocol.Message{
+		Type: protocol.MessageTypeChoke,
+	})
+}
+
+func (peer *Peer) unchoke() error {
+	log.Println("unchoking", peer)
+
+	// XXX don't block trying to send the control message to a slow peer
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if !peer.amChoking {
+		return nil
+	}
+	peer.amChoking = false
+
+	return peer.controlWrite(protocol.Message{
+		Type: protocol.MessageTypeUnchoke,
+	})
 }
 
 // Close closes the peer connection and waits for Peer.run to return.

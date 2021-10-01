@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-// OPT investigate if we should batch prometheus updates to reduce congestion.
+// How often we choke/unchoke peers. Spec calls for 30 seconds, libtorrent defaults to 15.
+const unchokeInterval = 15 * time.Second
 
 var DefaultSettings = Settings{
 	NumConcurrentAnnounces: 10,
@@ -337,6 +339,73 @@ func (sess *Session) listen() error {
 	}
 }
 
+func (sess *Session) unchokePeers() {
+	torrs := sess.torrentsWithPeers.Copy()
+	for torr := range torrs {
+		func() {
+			torr.stateMu.Lock()
+			defer torr.stateMu.Unlock()
+
+			peers := torr.peers.Copy()
+			choke := container.Set[*Peer]{} // peers we have to choke at the end
+			var interested []*Peer          // peers that want to be unchoked
+			for peer := range peers {
+				// first, choke all currently unchoked peers, in preparation for the selection of a new set of unchoked peers
+				peer.mu.RLock()
+				if !peer.amChoking {
+					choke.Add(peer)
+				}
+
+				// collect peers that are interested
+				if peer.peerInterested {
+					interested = append(interested, peer)
+				}
+				peer.mu.RUnlock()
+			}
+			log.Printf("%s: %d currently unchoked peers, %d interested peers", torr, len(choke), len(interested))
+
+			switch torr.state {
+			case TorrentStateLeeching:
+				panic("XXX unsupported")
+			case TorrentStateSeeding:
+				sort.Slice(interested, func(i, j int) bool {
+					// XXX implement peer selection here. Originally,
+					// the spec suggested selecting the peers we
+					// upload the fastest to. Later, it switched to a
+					// fairer, random selection.
+					return i < j
+				})
+				// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
+				const uploadSlotsPerTorrent = 5
+				max := uploadSlotsPerTorrent
+				if max > len(interested) {
+					max = len(interested)
+				}
+				for _, peer := range interested[:max] {
+					choke.Delete(peer)
+				}
+
+				log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), max)
+
+				// XXX don't block trying to send the control messages to a slow peer
+				for peer := range choke {
+					if err := peer.choke(); err != nil {
+						// XXX kill peer
+					}
+				}
+				for _, peer := range interested[:max] {
+					if err := peer.unchoke(); err != nil {
+						// XXX kill peer
+					}
+				}
+			default:
+				// This can happen because of the race between grabbing the list of torrents and torrents stopping
+				return
+			}
+		}()
+	}
+}
+
 func (sess *Session) Run() error {
 	defer close(sess.done)
 
@@ -346,10 +415,13 @@ func (sess *Session) Run() error {
 	}()
 
 	t := time.NewTicker(1 * time.Second)
+	tUnchoke := time.NewTicker(unchokeInterval)
 	for {
 		select {
-		// XXX don't depend on a timer for processing announces
+		case <-tUnchoke.C:
+			sess.unchokePeers()
 		case now := <-t.C:
+			// XXX don't depend on a timer for processing announces
 			// OPT don't iterate over all torrents, instead keep a list of torrents with outstanding announces
 			sess.mu.Lock()
 			for _, torr := range sess.torrents {
