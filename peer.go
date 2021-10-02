@@ -45,6 +45,11 @@ type Peer struct {
 	amChoking      bool
 	peerInterested bool
 
+	// Last time the peer was unchoked. This is set both when initially unchoking the peer, and when choking it.
+	//
+	// Accessed exclusively from Session.unchokePeers.
+	lastUnchoke time.Time
+
 	// accessed atomically
 	droppedRequests uint32
 	// amount of data transfered since the last time we've reported statistics
@@ -429,32 +434,34 @@ func (peer *Peer) run() error {
 }
 
 func (peer *Peer) choke() error {
-	log.Println("choking", peer)
-
-	// XXX don't block trying to send the control message to a slow peer
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 	if peer.amChoking {
 		return nil
 	}
+
+	log.Println("choking", peer)
+	peer.lastUnchoke = time.Now()
 	peer.amChoking = true
 
+	// XXX don't block trying to send the control message to a slow peer
 	return peer.controlWrite(protocol.Message{
 		Type: protocol.MessageTypeChoke,
 	})
 }
 
 func (peer *Peer) unchoke() error {
-	log.Println("unchoking", peer)
-
-	// XXX don't block trying to send the control message to a slow peer
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 	if !peer.amChoking {
 		return nil
 	}
-	peer.amChoking = false
 
+	log.Println("unchoking", peer)
+	peer.amChoking = false
+	peer.lastUnchoke = time.Now()
+
+	// XXX don't block trying to send the control message to a slow peer
 	return peer.controlWrite(protocol.Message{
 		Type: protocol.MessageTypeUnchoke,
 	})

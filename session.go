@@ -18,6 +18,7 @@ import (
 
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/container"
+	"honnef.co/go/bittorrent/mymath"
 	"honnef.co/go/bittorrent/protocol"
 
 	"github.com/zeebo/bencode"
@@ -347,16 +348,20 @@ func (sess *Session) unchokePeers() {
 			defer torr.stateMu.Unlock()
 
 			peers := torr.peers.Copy()
-			choke := container.Set[*Peer]{} // peers we have to choke at the end
-			var interested []*Peer          // peers that want to be unchoked
+			// Peers we have to choke at the end.
+			// This starts as the set of all currently unchoked peers.
+			// Peers we later decide to keep unchoked will be removed from it.
+			choke := container.Set[*Peer]{}
+			// All currently interested peers. A subset of them will be unchoked.
+			var interested []*Peer
 			for peer := range peers {
-				// first, choke all currently unchoked peers, in preparation for the selection of a new set of unchoked peers
 				peer.mu.RLock()
+				// All unchoked peers are candidates for choking
 				if !peer.amChoking {
 					choke.Add(peer)
 				}
 
-				// collect peers that are interested
+				// All interested peers are candidates for unchoking
 				if peer.peerInterested {
 					interested = append(interested, peer)
 				}
@@ -368,24 +373,24 @@ func (sess *Session) unchokePeers() {
 			case TorrentStateLeeching:
 				panic("XXX unsupported")
 			case TorrentStateSeeding:
-				sort.Slice(interested, func(i, j int) bool {
-					// XXX implement peer selection here. Originally,
-					// the spec suggested selecting the peers we
-					// upload the fastest to. Later, it switched to a
-					// fairer, random selection.
-					return i < j
-				})
 				// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
 				const uploadSlotsPerTorrent = 5
-				max := uploadSlotsPerTorrent
-				if max > len(interested) {
-					max = len(interested)
+
+				// Only sort peers if we have to select a subset of them.
+				// If there are more slots than interested peers, we'll end up selecting all peers, and their order will be irrelevant.
+				if len(interested) > uploadSlotsPerTorrent {
+					sort.Slice(interested, func(i, j int) bool {
+						// round robin the peers we unchoke
+						return interested[i].lastUnchoke.Before(interested[j].lastUnchoke)
+					})
 				}
-				for _, peer := range interested[:max] {
+
+				interested = interested[:mymath.Min(len(interested), uploadSlotsPerTorrent)]
+				for _, peer := range interested {
 					choke.Delete(peer)
 				}
 
-				log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), max)
+				log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), len(interested))
 
 				// XXX don't block trying to send the control messages to a slow peer
 				for peer := range choke {
@@ -393,7 +398,7 @@ func (sess *Session) unchokePeers() {
 						// XXX kill peer
 					}
 				}
-				for _, peer := range interested[:max] {
+				for _, peer := range interested {
 					if err := peer.unchoke(); err != nil {
 						// XXX kill peer
 					}
