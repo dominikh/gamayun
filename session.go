@@ -341,19 +341,27 @@ func (sess *Session) listen() error {
 }
 
 func (sess *Session) unchokePeers() {
+	// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
+	// TODO make this value configurable
+	const uploadSlotsPerTorrent = 5
+
 	torrs := sess.torrentsWithPeers.Copy()
 	for torr := range torrs {
 		func() {
 			torr.stateMu.Lock()
-			defer torr.stateMu.Unlock()
-
 			peers := torr.peers.Copy()
+			state := torr.state
+			torr.stateMu.Unlock()
+
 			// Peers we have to choke at the end.
 			// This starts as the set of all currently unchoked peers.
 			// Peers we later decide to keep unchoked will be removed from it.
 			choke := container.Set[*Peer]{}
 			// All currently interested peers. A subset of them will be unchoked.
-			var interested []*Peer
+			var interested []struct {
+				peer       *Peer
+				downloaded uint64
+			}
 			for peer := range peers {
 				peer.mu.RLock()
 				// All unchoked peers are candidates for choking
@@ -361,51 +369,118 @@ func (sess *Session) unchokePeers() {
 					choke.Add(peer)
 				}
 
+				// We always have to reset the download counter, even if the peer isn't interested at this point in time.
+				stat := atomic.SwapUint64(&peer.chokingStatistics.downloaded, 0)
+
 				// All interested peers are candidates for unchoking
 				if peer.peerInterested {
-					interested = append(interested, peer)
+					interested = append(interested, struct {
+						peer       *Peer
+						downloaded uint64
+					}{peer, stat})
 				}
 				peer.mu.RUnlock()
 			}
+
 			log.Printf("%s: %d currently unchoked peers, %d interested peers", torr, len(choke), len(interested))
 
-			switch torr.state {
+			// The peers we eventually decided to unchoke
+			unchoke := make([]*Peer, 0, uploadSlotsPerTorrent)
+			switch state {
 			case TorrentStateLeeching:
-				panic("XXX unsupported")
-			case TorrentStateSeeding:
-				// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
-				const uploadSlotsPerTorrent = 5
+				// In leeching mode we implement a tit-for-tat-inspired algorithm.
+				// The peers that upload to us the fastest will be unchoked.
+				// A small number of peers will be unchoked randomly,
+				// so that we can find potentially better peers,
+				// and to allow new clients to join the swarm.
 
-				// Only sort peers if we have to select a subset of them.
-				// If there are more slots than interested peers, we'll end up selecting all peers, and their order will be irrelevant.
-				if len(interested) > uploadSlotsPerTorrent {
+				// 20% of all slots - but at least 1 - will be used for opportunistic unchoking
+				opportunistic := mymath.Max(1, uploadSlotsPerTorrent/5)
+				log.Println(opportunistic, uploadSlotsPerTorrent, uploadSlotsPerTorrent-opportunistic, len(interested[:uploadSlotsPerTorrent-opportunistic]))
+
+				if len(interested) <= uploadSlotsPerTorrent {
+					// Unchoke all interested peers
+					for _, peer := range interested {
+						log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
+						unchoke = append(unchoke, peer.peer)
+					}
+				} else {
+					// Unchoke some peers based on their upload rate to us
 					sort.Slice(interested, func(i, j int) bool {
-						// round robin the peers we unchoke
-						return interested[i].lastUnchoke.Before(interested[j].lastUnchoke)
+						// favour the peers that upload the fastest to us
+						return interested[i].downloaded < interested[j].downloaded
 					})
-				}
+					for _, peer := range interested[:uploadSlotsPerTorrent-opportunistic] {
+						log.Printf("%s: unchoking %s because of reciprocation", torr, peer.peer)
+						unchoke = append(unchoke, peer.peer)
+					}
 
-				interested = interested[:mymath.Min(len(interested), uploadSlotsPerTorrent)]
-				for _, peer := range interested {
-					choke.Delete(peer)
-				}
+					// XXX optimistic unchoking should happen every 30s, while normal unchoking happens every 10s.
 
-				log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), len(interested))
-
-				// XXX don't block trying to send the control messages to a slow peer
-				for peer := range choke {
-					if err := peer.choke(); err != nil {
-						// XXX kill peer
+					remainder := interested[uploadSlotsPerTorrent-opportunistic:]
+					sess.rngMu.Lock()
+					// OPT Shuffling all the peers isn't too expensive and this is fine.
+					// However, if we have way more peers than optimistic unchoke slots,
+					// then generating random, unique indices is much faster,
+					// and it can even use a simple O(n²) uniqueness check, avoiding maps.
+					//
+					// Another option is using something like modernc.org/mathutil.FC32,
+					// but that suffers from a high up-front cost.
+					//
+					// Really, this is fine.
+					// Even if we had millions of peers, this would take less than a second.
+					// For realistic numbers of peers (say, 200), this takes microseconds.
+					sess.rng.Shuffle(len(remainder), func(i, j int) {
+						remainder[i], remainder[j] = remainder[j], remainder[i]
+					})
+					sess.rngMu.Unlock()
+					for _, peer := range remainder[:opportunistic] {
+						log.Printf("%s: unchoking %s optimistically", torr, peer.peer)
+						unchoke = append(unchoke, peer.peer)
 					}
 				}
-				for _, peer := range interested {
-					if err := peer.unchoke(); err != nil {
-						// XXX kill peer
+
+			case TorrentStateSeeding:
+				// In seeding mode, we cycle through peers in a round-robin fashion.
+				// This gives all peers an equal share of our time.
+
+				if len(interested) <= uploadSlotsPerTorrent {
+					// Unchoke all interested peers
+					for _, peer := range interested {
+						log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
+						unchoke = append(unchoke, peer.peer)
+					}
+				} else {
+					// Unchoke peers in a round-robin manner
+					sort.Slice(interested, func(i, j int) bool {
+						return interested[i].peer.lastUnchoke.Before(interested[j].peer.lastUnchoke)
+					})
+					for _, peer := range interested[:uploadSlotsPerTorrent] {
+						log.Printf("%s: unchoking %s because of round-robin", torr, peer.peer)
+						unchoke = append(unchoke, peer.peer)
 					}
 				}
+
 			default:
 				// This can happen because of the race between grabbing the list of torrents and torrents stopping
 				return
+			}
+
+			log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), len(unchoke))
+			for _, peer := range unchoke {
+				// Don't choke peers we want to keep unchoked
+				choke.Delete(peer)
+			}
+			// XXX don't block trying to send the control messages to a slow peer
+			for peer := range choke {
+				if err := peer.choke(); err != nil {
+					// XXX kill peer
+				}
+			}
+			for _, peer := range unchoke {
+				if err := peer.unchoke(); err != nil {
+					// XXX kill peer
+				}
 			}
 		}()
 	}

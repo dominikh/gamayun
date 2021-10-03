@@ -56,10 +56,18 @@ type Peer struct {
 	statistics struct {
 		// XXX check alignment on 32-bit systems
 		// XXX differentiate raw traffic and data traffic
-		uploaded    uint64
+
+		// How much data we have uploaded to the peer
+		uploaded uint64
+		// How much data we have downloaded from the peer
 		downloaded  uint64
 		last        time.Time
 		lastWasZero bool
+	}
+
+	// accessed atomically, used by the choking algorithm
+	chokingStatistics struct {
+		downloaded uint64
 	}
 }
 
@@ -140,8 +148,10 @@ func (peer *Peer) readPeer() error {
 	for {
 		select {
 		case msg := <-msgs:
-			atomic.AddUint64(&peer.session.statistics.downloadedRaw, uint64(msg.Size()))
-			atomic.AddUint64(&peer.statistics.downloaded, uint64(msg.Size()))
+			size := uint64(msg.Size())
+			atomic.AddUint64(&peer.session.statistics.downloadedRaw, size)
+			atomic.AddUint64(&peer.statistics.downloaded, size)
+			atomic.AddUint64(&peer.chokingStatistics.downloaded, size)
 			select {
 			case peer.msgs <- msg:
 			case <-peer.done:
