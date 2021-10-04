@@ -421,6 +421,22 @@ func (peer *Peer) run() error {
 					// XXX ignore Have if we've gotten HaveAll before (or is it a protocol violation?)
 					peer.have.Set(msg.Index)
 					peer.Torrent.availability.inc(msg.Index)
+
+					// If we're not yet interested in the peer and we do need this piece, become interested
+					// OPT don't check if we're a seeder
+					if !peer.amInterested {
+						peer.Torrent.mu.Lock()
+						if !peer.Torrent.have.Get(msg.Index) {
+							err := peer.controlWrite(protocol.Message{
+								Type: protocol.MessageTypeInterested,
+							})
+							if err != nil {
+								peer.Torrent.mu.Unlock()
+								return err
+							}
+						}
+						peer.Torrent.mu.Unlock()
+					}
 				case protocol.MessageTypeChoke:
 					// XXX handle
 					peer.peerChoking = true

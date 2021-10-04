@@ -140,6 +140,10 @@ func (set Bitset) Copy() Bitset {
 	return nset
 }
 
+func (set Bitset) Get(piece uint32) bool {
+	return set.bits.Bit(int(piece)) == 1
+}
+
 func (set *Bitset) Set(piece uint32) {
 	if set.bits.Bit(int(piece)) == 1 {
 		// Some clients send Have messages for pieces they already announced in the bitfield, and we don't want to count them twice
@@ -214,7 +218,7 @@ type Pieces struct {
 	// mapping from piece to entry in sorted_pieces
 	pieceIndices []uint32
 
-	// sorted list of pieces, indexed into by piece_indices
+	// pieces sorted by availability, in ascending order, indexed into by piece_indices
 	sortedPieces []uint32
 
 	// mapping from piece to availability
@@ -225,6 +229,35 @@ type Pieces struct {
 
 	// Number of peers that have all pieces. These aren't tracked in availabilities.
 	haveAll int
+}
+
+func (t *Pieces) pick(peer *Peer, numBlocks int) (piece, start, end int, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !peer.amInterested {
+		ok = false
+		return
+	}
+
+	if peer.have.count == 0 {
+		panic("interested in peer with no pieces")
+	}
+
+	if t.availabilities[t.sortedPieces[0]] == 0 && t.haveAll == 0 {
+		panic("peer has pieces but we think nobody has any pieces")
+	}
+
+	// XXX prefer partial pieces
+	for _, piece := range t.sortedPieces {
+		if peer.have.Get(piece) {
+			// XXX check which blocks we still need, return a contiguous span of those
+			log.Println("fetching piece", piece)
+		}
+	}
+
+	ok = false
+	return
 }
 
 func (t *Pieces) incAll() {
