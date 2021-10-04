@@ -168,6 +168,7 @@ func (torr *Torrent) Stop() {
 
 			torr.addAnnounce(Announce{
 				InfoHash: torr.Hash,
+				Tracker:  torr.Metainfo.Announce,
 				PeerID:   torr.trackerSession.PeerID,
 				Event:    "stopped",
 				Up:       torr.trackerSession.up,
