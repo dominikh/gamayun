@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +17,6 @@ import (
 
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/container"
-	"honnef.co/go/bittorrent/mymath"
 	"honnef.co/go/bittorrent/protocol"
 
 	"github.com/zeebo/bencode"
@@ -97,10 +95,9 @@ type Session struct {
 	eventsMu sync.Mutex
 	events   []Event
 
+	// OPT consider having one rng per torrent
 	rngMu sync.Mutex
 	rng   *rand.Rand
-
-	torrentsWithPeers container.ConcurrentSet[*Torrent]
 
 	// XXX check alignment on 32-bit
 	// accessed atomically
@@ -127,13 +124,12 @@ type Session struct {
 
 func NewSession() *Session {
 	return &Session{
-		Settings:          DefaultSettings,
-		torrents:          map[protocol.InfoHash]*Torrent{},
-		peers:             container.NewSet[*Peer](),
-		closing:           make(chan struct{}),
-		done:              make(chan struct{}),
-		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
-		torrentsWithPeers: container.NewConcurrentSet[*Torrent](),
+		Settings: DefaultSettings,
+		torrents: map[protocol.InfoHash]*Torrent{},
+		peers:    container.NewSet[*Peer](),
+		closing:  make(chan struct{}),
+		done:     make(chan struct{}),
+		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -197,12 +193,15 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		return nil, fmt.Errorf("torrent failed validation: %w", err)
 	}
 
+	// XXX move this code into a constructor
 	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
 		have:     NewBitset(),
 		session:  sess,
 		peers:    container.NewConcurrentSet[*Peer](),
+		// OPT tweak buffers
+		peerMsgs: make(chan peerMessage, 256),
 	}
 
 	// XXX ensure the on-disk files are of the right lengths
@@ -242,6 +241,8 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	}
 	atomic.AddUint64(&sess.statistics.numTorrents.stopped, 1)
 	sess.torrents[torr.Hash] = torr
+
+	go torr.run()
 
 	return torr, nil
 }
@@ -305,7 +306,6 @@ func (sess *Session) listen() error {
 				session: sess,
 
 				// OPT tweak buffers
-				msgs:             make(chan protocol.Message, 256),
 				incomingRequests: make(chan request, 256),
 				writes:           make(chan protocol.Message, 256),
 				controlWrites:    make(chan protocol.Message, 256),
@@ -340,152 +340,6 @@ func (sess *Session) listen() error {
 	}
 }
 
-func (sess *Session) unchokePeers() {
-	// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
-	// TODO make this value configurable
-	const uploadSlotsPerTorrent = 5
-
-	torrs := sess.torrentsWithPeers.Copy()
-	for torr := range torrs {
-		func() {
-			torr.stateMu.Lock()
-			peers := torr.peers.Copy()
-			state := torr.state
-			torr.stateMu.Unlock()
-
-			// Peers we have to choke at the end.
-			// This starts as the set of all currently unchoked peers.
-			// Peers we later decide to keep unchoked will be removed from it.
-			choke := container.Set[*Peer]{}
-			// All currently interested peers. A subset of them will be unchoked.
-			var interested []struct {
-				peer       *Peer
-				downloaded uint64
-			}
-			for peer := range peers {
-				peer.mu.RLock()
-				// All unchoked peers are candidates for choking
-				if !peer.amChoking {
-					choke.Add(peer)
-				}
-
-				// We always have to reset the download counter, even if the peer isn't interested at this point in time.
-				stat := atomic.SwapUint64(&peer.chokingStatistics.downloaded, 0)
-
-				// All interested peers are candidates for unchoking
-				if peer.peerInterested {
-					interested = append(interested, struct {
-						peer       *Peer
-						downloaded uint64
-					}{peer, stat})
-				}
-				peer.mu.RUnlock()
-			}
-
-			log.Printf("%s: %d currently unchoked peers, %d interested peers", torr, len(choke), len(interested))
-
-			// The peers we eventually decided to unchoke
-			unchoke := make([]*Peer, 0, uploadSlotsPerTorrent)
-			switch state {
-			case TorrentStateLeeching:
-				// In leeching mode we implement a tit-for-tat-inspired algorithm.
-				// The peers that upload to us the fastest will be unchoked.
-				// A small number of peers will be unchoked randomly,
-				// so that we can find potentially better peers,
-				// and to allow new clients to join the swarm.
-
-				// 20% of all slots - but at least 1 - will be used for opportunistic unchoking
-				opportunistic := mymath.Max(1, uploadSlotsPerTorrent/5)
-				log.Println(opportunistic, uploadSlotsPerTorrent, uploadSlotsPerTorrent-opportunistic, len(interested[:uploadSlotsPerTorrent-opportunistic]))
-
-				if len(interested) <= uploadSlotsPerTorrent {
-					// Unchoke all interested peers
-					for _, peer := range interested {
-						log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
-						unchoke = append(unchoke, peer.peer)
-					}
-				} else {
-					// Unchoke some peers based on their upload rate to us
-					sort.Slice(interested, func(i, j int) bool {
-						// favour the peers that upload the fastest to us
-						return interested[i].downloaded < interested[j].downloaded
-					})
-					for _, peer := range interested[:uploadSlotsPerTorrent-opportunistic] {
-						log.Printf("%s: unchoking %s because of reciprocation", torr, peer.peer)
-						unchoke = append(unchoke, peer.peer)
-					}
-
-					// XXX optimistic unchoking should happen every 30s, while normal unchoking happens every 10s.
-
-					remainder := interested[uploadSlotsPerTorrent-opportunistic:]
-					sess.rngMu.Lock()
-					// OPT Shuffling all the peers isn't too expensive and this is fine.
-					// However, if we have way more peers than optimistic unchoke slots,
-					// then generating random, unique indices is much faster,
-					// and it can even use a simple O(n²) uniqueness check, avoiding maps.
-					//
-					// Another option is using something like modernc.org/mathutil.FC32,
-					// but that suffers from a high up-front cost.
-					//
-					// Really, this is fine.
-					// Even if we had millions of peers, this would take less than a second.
-					// For realistic numbers of peers (say, 200), this takes microseconds.
-					sess.rng.Shuffle(len(remainder), func(i, j int) {
-						remainder[i], remainder[j] = remainder[j], remainder[i]
-					})
-					sess.rngMu.Unlock()
-					for _, peer := range remainder[:opportunistic] {
-						log.Printf("%s: unchoking %s optimistically", torr, peer.peer)
-						unchoke = append(unchoke, peer.peer)
-					}
-				}
-
-			case TorrentStateSeeding:
-				// In seeding mode, we cycle through peers in a round-robin fashion.
-				// This gives all peers an equal share of our time.
-
-				if len(interested) <= uploadSlotsPerTorrent {
-					// Unchoke all interested peers
-					for _, peer := range interested {
-						log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
-						unchoke = append(unchoke, peer.peer)
-					}
-				} else {
-					// Unchoke peers in a round-robin manner
-					sort.Slice(interested, func(i, j int) bool {
-						return interested[i].peer.lastUnchoke.Before(interested[j].peer.lastUnchoke)
-					})
-					for _, peer := range interested[:uploadSlotsPerTorrent] {
-						log.Printf("%s: unchoking %s because of round-robin", torr, peer.peer)
-						unchoke = append(unchoke, peer.peer)
-					}
-				}
-
-			default:
-				// This can happen because of the race between grabbing the list of torrents and torrents stopping
-				return
-			}
-
-			log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), len(unchoke))
-			for _, peer := range unchoke {
-				// Don't choke peers we want to keep unchoked
-				choke.Delete(peer)
-			}
-			// XXX don't block trying to send the control messages to a slow peer
-			for peer := range choke {
-				if err := peer.choke(); err != nil {
-					// XXX kill peer
-				}
-			}
-			for _, peer := range unchoke {
-				if err := peer.unchoke(); err != nil {
-					// XXX kill peer
-				}
-			}
-		}()
-	}
-}
-
 func (sess *Session) Run() error {
 	defer close(sess.done)
 
@@ -495,11 +349,8 @@ func (sess *Session) Run() error {
 	}()
 
 	t := time.NewTicker(1 * time.Second)
-	tUnchoke := time.NewTicker(unchokeInterval)
 	for {
 		select {
-		case <-tUnchoke.C:
-			sess.unchokePeers()
 		case now := <-t.C:
 			// XXX don't depend on a timer for processing announces
 			// OPT don't iterate over all torrents, instead keep a list of torrents with outstanding announces
@@ -645,6 +496,8 @@ func (sess *Session) announce(ctx context.Context, ann *Announce) (_ *TrackerRes
 		q["event"] = []string{ann.Event}
 	}
 
+	// XXX but what if one of the values contained an actual plus sign?
+	//
 	// Replace "+" with "%20" in encoded info hash. net/url thinks
 	// that "+" is an acceptable encoding of spaces in the query
 	// portion. It isn't.
