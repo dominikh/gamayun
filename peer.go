@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/peerid"
 	"honnef.co/go/bittorrent/protocol"
 )
 
@@ -31,6 +32,7 @@ type Peer struct {
 	// mutable, but doesn't need locking
 	// Pieces the peer has
 	peerID [20]byte
+	Client peerid.Client
 	have   Bitset
 	// The peer has sent one of the allowed initial messages
 	setup        bool
@@ -237,6 +239,7 @@ func (peer *Peer) run() (err error) {
 		return err
 	}
 	peer.peerID = peerID
+	peer.Client, _ = peerid.Parse(peerID)
 	if peer.session.Callbacks.PeerHandshakePeerID != nil {
 		if !peer.session.Callbacks.PeerHandshakePeerID(peer, peerID) {
 			return CallbackRejectedPeerIDError{peerID}

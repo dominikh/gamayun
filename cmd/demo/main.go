@@ -43,7 +43,7 @@ func main() {
 		return true
 	}
 	client.Callbacks.PeerHandshakePeerID = func(peer *bittorrent.Peer, id [20]byte) bool {
-		log.Printf("Peer %s wants to connect with peer ID %q", peer, id)
+		log.Printf("Peer %s wants to connect with peer ID %q and client %s", peer, id, peer.Client)
 		return true
 	}
 
