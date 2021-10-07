@@ -193,16 +193,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		return nil, fmt.Errorf("torrent failed validation: %w", err)
 	}
 
-	// XXX move this code into a constructor
-	torr := &Torrent{
-		Metainfo: info,
-		Hash:     hash,
-		have:     NewBitset(),
-		session:  sess,
-		peers:    container.NewConcurrentSet[*Peer](),
-		// OPT tweak buffers
-		peerMsgs: make(chan peerMessage, 256),
-	}
+	torr := NewTorrent(hash,info,sess)
 
 	// XXX ensure the on-disk files are of the right lengths
 

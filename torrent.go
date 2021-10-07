@@ -85,6 +85,18 @@ type Torrent struct {
 	have Bitset
 }
 
+func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent {
+	return &Torrent{
+		Metainfo: info,
+		Hash:     hash,
+		session:  sess,
+		have:     NewBitset(),
+		peers:    container.NewConcurrentSet[*Peer](),
+		// OPT tweak buffers
+		peerMsgs: make(chan peerMessage, 256),
+	}
+}
+
 func (torr *Torrent) addAnnounce(ann Announce) {
 	ann.Created = time.Now()
 	ann.NextTry = ann.Created
