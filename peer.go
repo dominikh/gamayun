@@ -276,9 +276,9 @@ func (peer *Peer) run() (err error) {
 	//
 	// These goroutines will exit either when they encounter read/write errors on the connection or when Peer.done gets closed.
 	// This combination should ensure that the goroutines always terminate when Peer.run returns.
-	go func() { channel.TrySend(peer.errs, peer.blockReader()) }()
-	go func() { channel.TrySend(peer.errs, peer.readPeer(msgs)) }()
-	go func() { channel.TrySend(peer.errs, peer.writePeer()) }()
+	go func() { peer.Kill(peer.blockReader()) }()
+	go func() { peer.Kill(peer.readPeer(msgs)) }()
+	go func() { peer.Kill(peer.writePeer()) }()
 
 	defer peer.updateStats()
 	trafficTicker := time.NewTicker(peerStatisticsInterval)
@@ -338,6 +338,10 @@ func (peer *Peer) Close() {
 
 func (peer *Peer) String() string {
 	return peer.conn.String()
+}
+
+func (peer *Peer) Kill(err error) {
+	channel.TrySend(peer.errs, err)
 }
 
 func (peer *Peer) updateStats() {

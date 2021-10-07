@@ -14,6 +14,8 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 )
 
+// TODO: when a blockReader fails, should we stop the torrent?
+
 // OPT don't run a torrent goroutine if the torrent has no peers
 
 type announceQueue[T any] struct {
@@ -563,7 +565,7 @@ func (torr *Torrent) run() {
 				torr.removePeer(pmsg.peer)
 			} else {
 				if err := torr.handlePeerMessage(pmsg.peer, pmsg.msg); err != nil {
-					channel.TrySend(pmsg.peer.errs, err)
+					pmsg.peer.Kill(err)
 				}
 			}
 		}
