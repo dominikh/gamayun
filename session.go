@@ -292,22 +292,7 @@ func (sess *Session) listen() error {
 				return ErrClosing
 			}
 
-			peer := &Peer{
-				conn:    pconn,
-				session: sess,
-
-				// OPT tweak buffers
-				incomingRequests: make(chan request, 256),
-				writes:           make(chan protocol.Message, 256),
-				controlWrites:    make(chan protocol.Message, 256),
-				done:             make(chan struct{}),
-
-				have:           NewBitset(),
-				amInterested:   false,
-				amChoking:      true,
-				peerInterested: false,
-				peerChoking:    true,
-			}
+			peer := NewPeer(pconn, sess)
 			sess.peers.Add(peer)
 
 			go func() {
