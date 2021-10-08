@@ -381,9 +381,14 @@ func (sess *Session) Shutdown(ctx context.Context) error {
 	// Torrent.Stop closes all peers associated with it; this loop
 	// closes the remaining peers, the ones which haven't finished the
 	// handshake yet.
+	//
+	// We need to hold sess.mu because this can race with peers
+	// disconnecting and removing themselves from the map.
+	sess.mu.Lock()
 	for peer := range sess.peers {
 		peer.Close()
 	}
+	sess.mu.Unlock()
 	log.Println("All peers done")
 
 	// XXX ideally, our context would be able to cancel the announces that Session.Run is currently working on
