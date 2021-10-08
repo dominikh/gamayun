@@ -12,8 +12,21 @@ import (
 )
 
 type Peer struct {
+	// OPT: use bitflags for interested and choked
+
 	conn    *protocol.Connection
 	session *Session
+
+	// A mapping of extensions to the IDs used by the peer (BEP 10).
+	//
+	// TODO only list the extensions we actually support; for now we list all of them just for testing purposes
+	extensions struct {
+		ltDontHave  int
+		shareMode   int
+		uploadOnly  int
+		utHolepunch int
+		utMetadata  int
+	}
 
 	// incoming
 	incomingRequests chan request
@@ -25,15 +38,18 @@ type Peer struct {
 	errs chan error
 	done chan struct{}
 
-	// OPT: bitflags
+	peerID [20]byte
+	// The peer's client, as parsed from their peer ID
+	PeerIDClient peerid.Client
+	// The peer's client, as reported by the extended handshake
+	ExtensionClient string
 
-	// immutable
+	// How many outstanding incoming requests the peer accepts
+	maxOutgoingRequests int
 
 	// mutable, but doesn't need locking
 	// Pieces the peer has
-	peerID [20]byte
-	Client peerid.Client
-	have   Bitset
+	have Bitset
 	// The peer has sent one of the allowed initial messages
 	setup        bool
 	amInterested bool
@@ -257,10 +273,20 @@ func (peer *Peer) run() (err error) {
 		return err
 	}
 	peer.peerID = peerID
-	peer.Client, _ = peerid.Parse(peerID)
+	peer.PeerIDClient, _ = peerid.Parse(peerID)
 	if peer.session.Callbacks.PeerHandshakePeerID != nil {
 		if !peer.session.Callbacks.PeerHandshakePeerID(peer, peerID) {
 			return CallbackRejectedPeerIDError{peerID}
+		}
+	}
+
+	if peer.conn.HasExtensionProtocol {
+		// Send our extended handshake
+		if err := peer.conn.SendExtendedHandshake(protocol.ExtendedHandshake{
+			ClientName:  peer.session.ClientName,
+			NumRequests: 250,
+		}); err != nil {
+			return err
 		}
 	}
 

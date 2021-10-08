@@ -374,35 +374,61 @@ func (torr *Torrent) unchokePeers() {
 	}
 }
 
+type ProtocolViolationError struct {
+	reason string
+}
+
+func (err ProtocolViolationError) Error() string { return err.reason }
+
 func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
+	// TODO: We may still receive messages for a peer even after we've killed it. Should we automatically ignore those messages?
+
 	if !peer.setup {
-		switch msg.Type {
-		case protocol.MessageTypeBitfield:
-			// XXX verify length and shape of bitfield
-			peer.have.SetBitfield(msg.Data)
-			bit := 0
-			for _, b := range msg.Data {
-				for n := 7; n >= 0; n-- {
-					bit++
-					if b&1<<n != 0 {
-						torr.availability.inc(uint32(bit))
+		if msg.Type == protocol.MessageTypeExtended {
+			if msg.Data[0] != 0 {
+				return ProtocolViolationError{"received extended message during peer setup phase, but it wasn't the extension handshake"}
+			}
+			hs, err := protocol.ParseExtendedHandshake(msg.Data[1:])
+			if err != nil {
+				return err
+			}
+			peer.extensions.ltDontHave = hs.Map["lt_donthave"]
+			peer.extensions.shareMode = hs.Map["share_mode"]
+			peer.extensions.uploadOnly = hs.Map["upload_only"]
+			peer.extensions.utHolepunch = hs.Map["ut_holepunch"]
+			peer.extensions.utMetadata = hs.Map["ut_metadata"]
+			peer.ExtensionClient = hs.ClientName
+			peer.maxOutgoingRequests = hs.NumRequests
+		} else {
+			switch msg.Type {
+			case protocol.MessageTypeBitfield:
+				// XXX verify length and shape of bitfield
+				peer.have.SetBitfield(msg.Data)
+				bit := 0
+				for _, b := range msg.Data {
+					for n := 7; n >= 0; n-- {
+						bit++
+						if b&1<<n != 0 {
+							torr.availability.inc(uint32(bit))
+						}
 					}
 				}
-			}
 
-		case protocol.MessageTypeHaveNone:
-		case protocol.MessageTypeHaveAll:
-			// OPT more efficient representation for HaveAll
-			for i := 0; i < torr.NumPieces(); i++ {
-				peer.have.Set(uint32(i))
+			case protocol.MessageTypeHaveNone:
+			case protocol.MessageTypeHaveAll:
+				// OPT more efficient representation for HaveAll
+				for i := 0; i < torr.NumPieces(); i++ {
+					peer.have.Set(uint32(i))
+				}
+				torr.availability.incAll()
+				defer torr.availability.decAll()
+			case protocol.MessageTypeExtended:
+				// nothing to do for now
+			default:
+				return ProtocolViolationError{fmt.Sprintf("unexpected message %q in peer setup phase", msg)}
 			}
-			torr.availability.incAll()
-			defer torr.availability.decAll()
-		default:
-			// XXX instead of panicing we should kill the peer for a protocol violation
-			panic(fmt.Sprintf("unexpected message %s", msg))
+			peer.setup = true
 		}
-		peer.setup = true
 	} else {
 		switch msg.Type {
 		case protocol.MessageTypeRequest:
@@ -468,13 +494,13 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 		case protocol.MessageTypeAllowedFast:
 			// XXX make use of this information
 		case protocol.MessageTypeKeepAlive:
-			// XXX should we respond?
+		// XXX should we respond?
+		case protocol.MessageTypeExtended:
+			// nothing to do for now
 		case protocol.MessageTypeBitfield, protocol.MessageTypeHaveNone, protocol.MessageTypeHaveAll:
-			// XXX instead of panicing we should kill the peer for a protocol violation
-			panic(fmt.Sprintf("unexpected message %s", msg))
+			return ProtocolViolationError{fmt.Sprintf("message %s after peer setup has finished", msg)}
 		default:
-			// XXX instead of panicing we should kill the peer for a protocol violation
-			panic(fmt.Sprintf("unhandled message %s", msg))
+			return ProtocolViolationError{fmt.Sprintf("unexpected message %s", msg)}
 		}
 	}
 

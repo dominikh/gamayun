@@ -28,9 +28,9 @@ func main() {
 	}()
 
 	client := bittorrent.NewSession()
-	prometheus.DefaultRegisterer.MustRegister(client)
-
 	client.PeerIDPrefix = []byte("GMY0001-")
+	client.ClientName = "Gamayun 0.0.1"
+
 	client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
 		log.Println("New peer:", pconn)
 		return true
@@ -43,9 +43,10 @@ func main() {
 		return true
 	}
 	client.Callbacks.PeerHandshakePeerID = func(peer *bittorrent.Peer, id [20]byte) bool {
-		log.Printf("Peer %s wants to connect with peer ID %q and client %s", peer, id, peer.Client)
+		log.Printf("Peer %s wants to connect with peer ID %q and client %s", peer, id, peer.PeerIDClient)
 		return true
 	}
+	prometheus.DefaultRegisterer.MustRegister(client)
 
 	go func() {
 		err := client.Run()

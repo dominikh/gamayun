@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/zeebo/bencode"
 )
 
 type InfoHash [20]byte
@@ -30,12 +32,9 @@ const (
 	MessageTypeSuggestPiece  MessageType = 0x0D
 	MessageTypeHaveAll       MessageType = 0x0e
 	MessageTypeHaveNone      MessageType = 0x0f
+	MessageTypeExtended      MessageType = 0x14
 
 	MessageTypeKeepAlive MessageType = 0xFF // not used as a type in the protocol, zero-length messages are keep alives
-)
-
-const (
-	ExtensionFast uint64 = 0x04
 )
 
 type Connection struct {
@@ -45,7 +44,8 @@ type Connection struct {
 	writeBuf [][handshakeLength]byte
 
 	// OPT(dh): use bitfield for extensions
-	HasFastPeers bool
+	HasFastPeers         bool
+	HasExtensionProtocol bool
 }
 
 func (conn *Connection) Close() error { return conn.Conn.Close() }
@@ -83,12 +83,35 @@ func (conn *Connection) SendHandshake(infoHash, peerID [20]byte) error {
 	b := conn.writeBuf[0]
 
 	var reserved [8]byte
-	binary.BigEndian.PutUint64(reserved[:], ExtensionFast)
+	reserved[7] |= 0x04 // BEP 6, Fast Extension
+	reserved[5] |= 0x10 // BEP 10, Extension Protocol
 
 	b[0] = byte(len(protocol))
 	ncopy(b[1:], []byte(protocol), reserved[:], infoHash[:], peerID[:])
 	_, err := conn.Conn.Write(b[:])
 	return err
+}
+
+type ExtendedHandshake struct {
+	Map         map[string]int `bencode:"m"`
+	ClientName  string         `bencode:"v"`
+	NumRequests int            `bencode:"reqq"`
+}
+
+func (conn *Connection) SendExtendedHandshake(hs ExtendedHandshake) error {
+	b, err := bencode.EncodeBytes(hs)
+	if err != nil {
+		panic(err)
+	}
+
+	msg := make([]byte, len(b)+1)
+	msg[0] = 0 // message type 0, handshake
+	copy(msg[1:], b)
+
+	return conn.WriteMessage(Message{
+		Type: MessageTypeExtended,
+		Data: msg,
+	})
 }
 
 const handshakeReadTimeout = 10 * time.Second
@@ -111,6 +134,10 @@ func (conn *Connection) ReadHandshake() (InfoHash, error) {
 		conn.HasFastPeers = true
 	}
 
+	if (b[6] & 0x10) != 0 {
+		conn.HasExtensionProtocol = true
+	}
+
 	var out [20]byte
 	copy(out[:], b[1+len(protocol)+8:])
 
@@ -129,7 +156,7 @@ type Message struct {
 	Index  uint32 // Have, Request, Piece, Cancel
 	Begin  uint32 // Request, Piece, Cancel
 	Length uint32 // Request, Cancel
-	Data   []byte // Bitfield, Piece
+	Data   []byte // Bitfield, Piece, Extended
 }
 
 func (msg Message) String() string {
@@ -164,6 +191,8 @@ func (msg Message) String() string {
 		return "have-none"
 	case MessageTypeKeepAlive:
 		return "keep-alive"
+	case MessageTypeExtended:
+		return "extended"
 	default:
 		return fmt.Sprintf("unknown-message(%d)", msg.Type)
 	}
@@ -232,6 +261,8 @@ func (conn *Connection) ReadMessage() (Message, error) {
 		msg.Index = binary.BigEndian.Uint32(b[1:])
 	case MessageTypeHaveAll:
 	case MessageTypeHaveNone:
+	case MessageTypeExtended:
+		msg.Data = copyb(b[1:])
 	default:
 		// XXX don't panic because of a protocol error
 		panic(fmt.Sprintf("unhandled message %d", b[0]))
@@ -336,6 +367,10 @@ func (conn *Connection) WriteMessages(msgs []Message) error {
 			binary.BigEndian.PutUint32(sb[5:], msg.Index)
 			binary.BigEndian.PutUint32(sb[9:], msg.Begin)
 			bufs = append(bufs, sb[:13], msg.Data)
+		case MessageTypeExtended:
+			binary.BigEndian.PutUint32(sb[:], uint32(len(msg.Data)+1))
+			sb[4] = byte(MessageTypeExtended)
+			bufs = append(bufs, sb[:5], msg.Data)
 		default:
 			panic(fmt.Sprintf("unreachable: %s", msg.Type))
 		}
@@ -349,4 +384,10 @@ func (conn *Connection) WriteMessage(msg Message) error {
 	// XXX add locking
 
 	return conn.WriteMessages([]Message{msg})
+}
+
+func ParseExtendedHandshake(b []byte) (ExtendedHandshake, error) {
+	var hs ExtendedHandshake
+	err := bencode.DecodeBytes(b, &hs)
+	return hs, err
 }

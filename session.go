@@ -43,6 +43,7 @@ type Settings struct {
 type Session struct {
 	Settings     Settings
 	PeerIDPrefix []byte
+	ClientName   string
 
 	// XXX rename this field. these functions are only used for
 	// decision making, and are separate from events, which are
@@ -193,7 +194,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		return nil, fmt.Errorf("torrent failed validation: %w", err)
 	}
 
-	torr := NewTorrent(hash,info,sess)
+	torr := NewTorrent(hash, info, sess)
 
 	// XXX ensure the on-disk files are of the right lengths
 
