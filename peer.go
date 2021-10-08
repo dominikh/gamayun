@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
-	"honnef.co/go/bittorrent/peerid"
 	"honnef.co/go/bittorrent/protocol"
 )
 
@@ -39,10 +38,8 @@ type Peer struct {
 	done chan struct{}
 
 	peerID [20]byte
-	// The peer's client, as parsed from their peer ID
-	PeerIDClient peerid.Client
 	// The peer's client, as reported by the extended handshake
-	ExtensionClient string
+	ClientName string
 
 	// How many outstanding incoming requests the peer accepts
 	maxOutgoingRequests int
@@ -273,7 +270,6 @@ func (peer *Peer) run() (err error) {
 		return err
 	}
 	peer.peerID = peerID
-	peer.PeerIDClient, _ = peerid.Parse(peerID)
 	if peer.session.Callbacks.PeerHandshakePeerID != nil {
 		if !peer.session.Callbacks.PeerHandshakePeerID(peer, peerID) {
 			return CallbackRejectedPeerIDError{peerID}

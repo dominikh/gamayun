@@ -397,7 +397,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			peer.extensions.uploadOnly = hs.Map["upload_only"]
 			peer.extensions.utHolepunch = hs.Map["ut_holepunch"]
 			peer.extensions.utMetadata = hs.Map["ut_metadata"]
-			peer.ExtensionClient = hs.ClientName
+			peer.ClientName = hs.ClientName
 			peer.maxOutgoingRequests = hs.NumRequests
 		} else {
 			switch msg.Type {
