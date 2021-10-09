@@ -13,6 +13,10 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 )
 
+// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
+// TODO make this value configurable
+const uploadSlotsPerTorrent = 5
+
 // TODO: when a blockReader fails, should we stop the torrent?
 
 // OPT don't run a torrent goroutine if the torrent has no peers
@@ -79,6 +83,8 @@ type Torrent struct {
 	action         Action
 	trackerSession trackerSession
 	peers          container.ConcurrentSet[*Peer]
+
+	numUnchoked int
 
 	peerMsgs chan peerMessage
 
@@ -233,10 +239,6 @@ func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 }
 
 func (torr *Torrent) unchokePeers() {
-	// TODO implement dynamic slot allocation, see https://github.com/dominikh/gamayun/issues/13
-	// TODO make this value configurable
-	const uploadSlotsPerTorrent = 5
-
 	// Peers we have to choke at the end.
 	// This starts as the set of all currently unchoked peers.
 	// Peers we later decide to keep unchoked will be removed from it.
@@ -284,7 +286,6 @@ func (torr *Torrent) unchokePeers() {
 
 		// 20% of all slots - but at least 1 - will be used for opportunistic unchoking
 		opportunistic := mymath.Max(1, uploadSlotsPerTorrent/5)
-		log.Println(opportunistic, uploadSlotsPerTorrent, uploadSlotsPerTorrent-opportunistic, len(interested[:uploadSlotsPerTorrent-opportunistic]))
 
 		if len(interested) <= uploadSlotsPerTorrent {
 			// Unchoke all interested peers
@@ -354,11 +355,19 @@ func (torr *Torrent) unchokePeers() {
 		return
 	}
 
-	log.Printf("%s: choking %d peers, unchoking %d peers", torr, len(choke), len(unchoke))
 	for _, peer := range unchoke {
 		// Don't choke peers we want to keep unchoked
 		choke.Delete(peer)
 	}
+
+	actual := 0
+	for _, peer := range unchoke {
+		if peer.amChoking {
+			actual++
+		}
+	}
+	log.Printf("%s: choking %d peers, unchoking %d peers, %d unchoked peers total", torr, len(choke), actual, len(unchoke))
+
 	// XXX don't block trying to send the control messages to a slow peer
 	for peer := range choke {
 		if err := peer.choke(); err != nil {
@@ -370,6 +379,8 @@ func (torr *Torrent) unchokePeers() {
 			// XXX kill peer
 		}
 	}
+
+	torr.numUnchoked = len(unchoke)
 }
 
 type ProtocolViolationError struct {
@@ -463,6 +474,12 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			}
 		case protocol.MessageTypeInterested:
 			peer.peerInterested = true
+			if torr.numUnchoked < uploadSlotsPerTorrent {
+				// We have free slots, unchoke the peer immediately.
+				log.Printf("%s: unchoking %s immediately", torr, peer)
+				peer.unchoke()
+				torr.numUnchoked++
+			}
 		case protocol.MessageTypeNotInterested:
 			peer.peerInterested = false
 		case protocol.MessageTypeHave:
