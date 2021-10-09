@@ -5,7 +5,6 @@ import (
 	"log"
 	"sort"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -123,8 +122,8 @@ func (torr *Torrent) Start() {
 	}
 
 	torr.trackerSession.nextAnnounce = time.Time{}
-	torr.trackerSession.up = 0
-	torr.trackerSession.down = 0
+	torr.trackerSession.up.Store(0)
+	torr.trackerSession.down.Store(0)
 	torr.trackerSession.PeerID = torr.session.GeneratePeerID()
 	torr.addAnnounce(Announce{
 		InfoHash: torr.Hash,
@@ -144,11 +143,11 @@ func (torr *Torrent) Start() {
 func (torr *Torrent) updatePrometheusState(state TorrentState, delta uint64) {
 	switch state {
 	case TorrentStateLeeching:
-		atomic.AddUint64(&torr.session.statistics.numTorrents.leeching, delta)
+		torr.session.statistics.numTorrents.leeching.Add(delta)
 	case TorrentStateSeeding:
-		atomic.AddUint64(&torr.session.statistics.numTorrents.seeding, delta)
+		torr.session.statistics.numTorrents.seeding.Add(delta)
 	case TorrentStateStopped:
-		atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, delta)
+		torr.session.statistics.numTorrents.stopped.Add(delta)
 	default:
 		panic("unhandled state")
 	}
@@ -166,7 +165,6 @@ func (torr *Torrent) Stop() {
 
 	if torr.action != nil {
 		torr.action.Stop()
-
 	} else {
 		if torr.state != TorrentStateStopped {
 			torr.setState(TorrentStateStopped)
@@ -180,8 +178,8 @@ func (torr *Torrent) Stop() {
 				Tracker:  torr.Metainfo.Announce,
 				PeerID:   torr.trackerSession.PeerID,
 				Event:    "stopped",
-				Up:       torr.trackerSession.up,
-				Down:     torr.trackerSession.down,
+				Up:       torr.trackerSession.up.Load(),
+				Down:     torr.trackerSession.down.Load(),
 			})
 		}
 	}
@@ -220,16 +218,16 @@ func (torr *Torrent) NumPieces() int {
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
 	torr.Stop()
 
-	atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, ^uint64(0))
-	atomic.AddUint64(&torr.session.statistics.numTorrents.action, 1)
+	torr.session.statistics.numTorrents.stopped.Add(^uint64(0))
+	torr.session.statistics.numTorrents.action.Add(1)
 
 	// XXX guard against a concurrent call to Start
 	torr.action = l
 	res, stopped, err := torr.action.Run()
 	torr.action = nil
 
-	atomic.AddUint64(&torr.session.statistics.numTorrents.stopped, 1)
-	atomic.AddUint64(&torr.session.statistics.numTorrents.action, ^uint64(0))
+	torr.session.statistics.numTorrents.stopped.Add(1)
+	torr.session.statistics.numTorrents.action.Add(^uint64(0))
 
 	return res, stopped, err
 }
@@ -256,7 +254,7 @@ func (torr *Torrent) unchokePeers() {
 		}
 
 		// We always have to reset the download counter, even if the peer isn't interested at this point in time.
-		stat := atomic.SwapUint64(&peer.chokingStatistics.downloaded, 0)
+		stat := peer.chokingStatistics.downloaded.Swap(0)
 
 		// All interested peers are candidates for unchoking
 		if peer.peerInterested {
@@ -512,7 +510,7 @@ func (torr *Torrent) trackPeer(peer *Peer) (peerID [20]byte, err error) {
 	defer torr.stateMu.Unlock()
 	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
-		atomic.AddUint64(&torr.session.statistics.numRejectedPeers.stoppedTorrent, 1)
+		torr.session.statistics.numRejectedPeers.stoppedTorrent.Add(1)
 		return [20]byte{}, StoppedTorrentError{torr.Hash}
 	}
 	peer.Torrent = torr

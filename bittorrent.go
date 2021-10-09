@@ -75,6 +75,7 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
 
@@ -98,8 +99,8 @@ func verifyBlock(data []byte, checksum []byte) bool {
 type trackerSession struct {
 	PeerID       [20]byte
 	nextAnnounce time.Time
-	up           uint64
-	down         uint64
+	up           oursync.Uint64
+	down         oursync.Uint64
 }
 
 type Announce struct {

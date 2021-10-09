@@ -3,10 +3,10 @@ package bittorrent
 import (
 	"log"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
 
@@ -63,24 +63,22 @@ type Peer struct {
 	// Accessed exclusively from Session.unchokePeers.
 	lastUnchoke time.Time
 
-	// accessed atomically
-	droppedRequests uint32
 	// amount of data transfered since the last time we've reported statistics
 	statistics struct {
 		// XXX check alignment on 32-bit systems
 		// XXX differentiate raw traffic and data traffic
 
 		// How much data we have uploaded to the peer
-		uploaded uint64
+		uploaded oursync.Uint64
 		// How much data we have downloaded from the peer
-		downloaded  uint64
+		downloaded  oursync.Uint64
 		last        time.Time
 		lastWasZero bool
 	}
 
-	// accessed atomically, used by the choking algorithm
+	// Statistics used by the choking algorithm.
 	chokingStatistics struct {
-		downloaded uint64
+		downloaded oursync.Uint64
 	}
 }
 
@@ -180,9 +178,9 @@ func (peer *Peer) readPeer(sendTo chan<- protocol.Message) error {
 		select {
 		case msg := <-msgs:
 			size := uint64(msg.Size())
-			atomic.AddUint64(&peer.session.statistics.downloadedRaw, size)
-			atomic.AddUint64(&peer.statistics.downloaded, size)
-			atomic.AddUint64(&peer.chokingStatistics.downloaded, size)
+			peer.session.statistics.downloadedRaw.Add(size)
+			peer.statistics.downloaded.Add(size)
+			peer.chokingStatistics.downloaded.Add(size)
 			select {
 			case sendTo <- msg:
 			case <-peer.done:
@@ -198,8 +196,8 @@ func (peer *Peer) readPeer(sendTo chan<- protocol.Message) error {
 
 func (peer *Peer) writePeer() error {
 	writeMsg := func(msg protocol.Message) error {
-		atomic.AddUint64(&peer.session.statistics.uploadedRaw, uint64(msg.Size()))
-		atomic.AddUint64(&peer.statistics.uploaded, uint64(msg.Size()))
+		peer.session.statistics.uploadedRaw.Add(uint64(msg.Size()))
+		peer.statistics.uploaded.Add(uint64(msg.Size()))
 		return peer.conn.WriteMessage(msg)
 	}
 
@@ -238,7 +236,7 @@ func (peer *Peer) run() (err error) {
 
 	if peer.session.Callbacks.PeerHandshakeInfoHash != nil {
 		if !peer.session.Callbacks.PeerHandshakeInfoHash(peer, hash) {
-			atomic.AddUint64(&peer.session.statistics.numRejectedPeers.peerHandshakeInfoHashCallback, 1)
+			peer.session.statistics.numRejectedPeers.peerHandshakeInfoHashCallback.Add(1)
 			return CallbackRejectedInfoHashError{hash}
 		}
 	}
@@ -247,7 +245,7 @@ func (peer *Peer) run() (err error) {
 	torr, ok := peer.session.torrents[hash]
 	peer.session.mu.RUnlock()
 	if !ok {
-		atomic.AddUint64(&peer.session.statistics.numRejectedPeers.unknownTorrent, 1)
+		peer.session.statistics.numRejectedPeers.unknownTorrent.Add(1)
 		return UnknownTorrentError{hash}
 	}
 
@@ -369,8 +367,8 @@ func (peer *Peer) Kill(err error) {
 func (peer *Peer) updateStats() {
 	now := time.Now()
 	defer func() { peer.statistics.last = now }()
-	up := atomic.SwapUint64(&peer.statistics.uploaded, 0)
-	down := atomic.SwapUint64(&peer.statistics.downloaded, 0)
+	up := peer.statistics.uploaded.Swap(0)
+	down := peer.statistics.downloaded.Swap(0)
 
 	// XXX the tracker cares about data traffic, not raw traffic
 	//
@@ -382,8 +380,8 @@ func (peer *Peer) updateStats() {
 	//
 	// We do, however, have to use atomic operations, because multiple
 	// peers may be updating the same torrent's stats.
-	atomic.AddUint64(&peer.Torrent.trackerSession.up, up)
-	atomic.AddUint64(&peer.Torrent.trackerSession.down, down)
+	peer.Torrent.trackerSession.up.Add(up)
+	peer.Torrent.trackerSession.down.Add(down)
 
 	if up == 0 && down == 0 {
 		if peer.statistics.lastWasZero {

@@ -1,8 +1,6 @@
 package bittorrent
 
 import (
-	"sync/atomic"
-
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/protobuf/proto"
@@ -77,72 +75,72 @@ var (
 func (sess *Session) Collect(ch chan<- prometheus.Metric) {
 	// bittorrent_peers_connected
 	ch <- Gauge{
-		Value:       atomic.LoadUint64(&sess.statistics.numConnectedPeers),
+		Value:       sess.statistics.numConnectedPeers.Load(),
 		Description: promPeersConnectedDesc,
 	}
 
 	// bittorrent_uploaded_raw_bytes
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.uploadedRaw),
+		Value:       sess.statistics.uploadedRaw.Load(),
 		Description: promUploadedRawDesc,
 	}
 
 	// bittorrent_downloaded_raw_bytes
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.downloadedRaw),
+		Value:       sess.statistics.downloadedRaw.Load(),
 		Description: promDownloadedRawDesc,
 	}
 
 	// bittorrent_peers_rejected_total
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.peerIncomingCallback),
+		Value:       sess.statistics.numRejectedPeers.peerIncomingCallback.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedPeerIncomingCallbackLabel,
 	}
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.peerHandshakeInfoHashCallback),
+		Value:       sess.statistics.numRejectedPeers.peerHandshakeInfoHashCallback.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedPeerHandshakeInfoHashCallbackLabel,
 	}
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.sessionLimit),
+		Value:       sess.statistics.numRejectedPeers.sessionLimit.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedSessionLimitLabel,
 	}
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.shutdown),
+		Value:       sess.statistics.numRejectedPeers.shutdown.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedShutdownLabel,
 	}
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.unknownTorrent),
+		Value:       sess.statistics.numRejectedPeers.unknownTorrent.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedUnknownTorrentLabel,
 	}
 	ch <- Counter{
-		Value:       atomic.LoadUint64(&sess.statistics.numRejectedPeers.stoppedTorrent),
+		Value:       sess.statistics.numRejectedPeers.stoppedTorrent.Load(),
 		Description: promPeersRejectedDesc,
 		Labels:      promPeersRejectedStoppedTorrentLabel,
 	}
 
 	// bittorrent_torrents
 	ch <- Gauge{
-		Value:       atomic.LoadUint64(&sess.statistics.numTorrents.stopped),
+		Value:       sess.statistics.numTorrents.stopped.Load(),
 		Description: promTorrentsDesc,
 		Labels:      promTorrentsStoppedLabel,
 	}
 	ch <- Gauge{
-		Value:       atomic.LoadUint64(&sess.statistics.numTorrents.leeching),
+		Value:       sess.statistics.numTorrents.leeching.Load(),
 		Description: promTorrentsDesc,
 		Labels:      promTorrentsLeechingLabel,
 	}
 	ch <- Gauge{
-		Value:       atomic.LoadUint64(&sess.statistics.numTorrents.seeding),
+		Value:       sess.statistics.numTorrents.seeding.Load(),
 		Description: promTorrentsDesc,
 		Labels:      promTorrentsSeedingLabel,
 	}
 	ch <- Gauge{
-		Value:       atomic.LoadUint64(&sess.statistics.numTorrents.action),
+		Value:       sess.statistics.numTorrents.action.Load(),
 		Description: promTorrentsDesc,
 		Labels:      promTorrentsActionLabel,
 	}
