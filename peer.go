@@ -2,7 +2,6 @@ package bittorrent
 
 import (
 	"log"
-	"sync"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -11,10 +10,15 @@ import (
 )
 
 type Peer struct {
-	// OPT: use bitflags for interested and choked
-
 	conn    *protocol.Connection
 	session *Session
+
+	peerID [20]byte
+	// The peer's client, as reported by the extended handshake
+	ClientName string
+
+	// How many outstanding incoming requests the peer accepts
+	maxOutgoingRequests int
 
 	// A mapping of extensions to the IDs used by the peer (BEP 10).
 	//
@@ -27,35 +31,16 @@ type Peer struct {
 		utMetadata  int
 	}
 
-	// incoming
-	incomingRequests chan request
-
-	// outgoing
-	controlWrites chan protocol.Message
-	writes        chan protocol.Message
-
-	errs chan error
-	done chan struct{}
-
-	peerID [20]byte
-	// The peer's client, as reported by the extended handshake
-	ClientName string
-
-	// How many outstanding incoming requests the peer accepts
-	maxOutgoingRequests int
-
 	// mutable, but doesn't need locking
 	// Pieces the peer has
 	have Bitset
 	// The peer has sent one of the allowed initial messages
-	setup        bool
-	amInterested bool
-	peerChoking  bool
-	Torrent      *Torrent // XXX make sure this doesn't need locking, now that it is exported
+	setup   bool
+	Torrent *Torrent // XXX make sure this doesn't need locking, now that it is exported
 
-	// mutable, needs lock held
-	mu             sync.RWMutex
 	amChoking      bool
+	amInterested   bool
+	peerChoking    bool
 	peerInterested bool
 
 	// Last time the peer was unchoked. This is set both when initially unchoking the peer, and when choking it.
@@ -63,7 +48,7 @@ type Peer struct {
 	// Accessed exclusively from Session.unchokePeers.
 	lastUnchoke time.Time
 
-	// amount of data transfered since the last time we've reported statistics
+	// Amount of data transfered since the last time we've reported statistics as an event.
 	statistics struct {
 		// XXX check alignment on 32-bit systems
 		// XXX differentiate raw traffic and data traffic
@@ -80,6 +65,23 @@ type Peer struct {
 	chokingStatistics struct {
 		downloaded oursync.Uint64
 	}
+
+	// Incoming requests from this peer.
+	// Torrent.run sends to it, Peer.blockReader reads from it.
+	incomingRequests chan request
+
+	// Messages to write to the peer.
+	// Several places send to it, Peer.writePeer reads from it.
+	controlWrites chan protocol.Message
+	writes        chan protocol.Message
+
+	// A buffered channel that can hold one error.
+	// It is used to communicate a fatal error to Peer.run.
+	// Peer.Kill sends to it.
+	errs chan error
+
+	// This channel gets closed once Peer.run has returned.
+	done chan struct{}
 }
 
 func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
@@ -317,8 +319,6 @@ func (peer *Peer) run() (err error) {
 }
 
 func (peer *Peer) choke() error {
-	peer.mu.Lock()
-	defer peer.mu.Unlock()
 	if peer.amChoking {
 		return nil
 	}
@@ -334,8 +334,6 @@ func (peer *Peer) choke() error {
 }
 
 func (peer *Peer) unchoke() error {
-	peer.mu.Lock()
-	defer peer.mu.Unlock()
 	if !peer.amChoking {
 		return nil
 	}
