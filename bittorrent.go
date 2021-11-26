@@ -13,7 +13,7 @@
 //
 // Callbacks are executed synchronously as we cannot proceed until we get their results.
 // In some cases, this means that callbacks should finish as quickly as possible, so that good performance can be maintained.
-// In other cases, deliberately delays can be used to implement rate control, for example to throttle the rate of incoming connections.
+// In other cases, deliberate delays can be used to implement rate control, for example to throttle the rate of incoming connections.
 //
 // Events
 //
@@ -69,6 +69,7 @@ import (
 	"log"
 	"math/big"
 	"math/bits"
+	"math/rand"
 	"os"
 	"sort"
 	"sync"
@@ -78,6 +79,17 @@ import (
 	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
+
+type lockedRand struct {
+	mu  sync.Mutex
+	rng *rand.Rand
+}
+
+func (rng *lockedRand) Intn(n int) int {
+	rng.mu.Lock()
+	defer rng.mu.Unlock()
+	return rng.rng.Intn(n)
+}
 
 // The maximum number of peers per torrent the code supports.
 const maxPeersPerTorrent = 65535
@@ -401,6 +413,8 @@ func NewVerify(torr *Torrent) Action {
 		},
 	}
 }
+
+// TODO(dh): add necessary interfaces so that we don't depend on the file system. something that can open paths and return io.ReaderAts.
 
 // OPT cache open files
 type dataStorage struct {

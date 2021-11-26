@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -96,10 +95,6 @@ type Session struct {
 	eventsMu sync.Mutex
 	events   []Event
 
-	// OPT consider having one rng per torrent
-	rngMu sync.Mutex
-	rng   *rand.Rand
-
 	// XXX check alignment on 32-bit
 	statistics struct {
 		numConnectedPeers oursync.Uint64
@@ -129,7 +124,6 @@ func NewSession() *Session {
 		peers:    container.NewSet[*Peer](),
 		closing:  make(chan struct{}),
 		done:     make(chan struct{}),
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -504,22 +498,4 @@ func (sess *Session) announce(ctx context.Context, ann *Announce) (_ *TrackerRes
 	}
 
 	return &tresp, nil
-}
-
-func (sess *Session) GeneratePeerID() [20]byte {
-	const minAscii = 33
-	const maxAscii = 127
-
-	var peerID [20]byte
-	copy(peerID[:], sess.PeerIDPrefix)
-	if len(sess.PeerIDPrefix) < 20 {
-		suffix := peerID[len(sess.PeerIDPrefix):]
-		sess.rngMu.Lock()
-		for i := range suffix {
-			suffix[i] = byte(sess.rng.Intn(maxAscii-minAscii) + minAscii)
-		}
-		sess.rngMu.Unlock()
-	}
-
-	return peerID
 }

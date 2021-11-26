@@ -2,6 +2,7 @@ package bittorrent
 
 import (
 	"fmt"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -75,6 +76,8 @@ type Torrent struct {
 	data         *dataStorage
 	session      *Session
 	announces    announceQueue[Announce]
+	peerIDRng    lockedRand
+	mainRng      *rand.Rand
 
 	// Mutex used to prevent concurrent Start and Stop calls
 	stateMu        sync.Mutex
@@ -98,9 +101,29 @@ func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent 
 		session:  sess,
 		have:     NewBitset(),
 		peers:    container.NewConcurrentSet[*Peer](),
+		peerIDRng: lockedRand{
+			rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		},
+		mainRng: rand.New(rand.NewSource(time.Now().UnixNano())),
 		// OPT tweak buffers
 		peerMsgs: make(chan peerMessage, 256),
 	}
+}
+
+func (torr *Torrent) GeneratePeerID() [20]byte {
+	const minAscii = 33
+	const maxAscii = 127
+
+	var peerID [20]byte
+	copy(peerID[:], torr.session.PeerIDPrefix)
+	if len(torr.session.PeerIDPrefix) < 20 {
+		suffix := peerID[len(torr.session.PeerIDPrefix):]
+		for i := range suffix {
+			suffix[i] = byte(torr.peerIDRng.Intn(maxAscii-minAscii) + minAscii)
+		}
+	}
+
+	return peerID
 }
 
 func (torr *Torrent) addAnnounce(ann Announce) {
@@ -129,7 +152,7 @@ func (torr *Torrent) Start() {
 	torr.trackerSession.nextAnnounce = time.Time{}
 	torr.trackerSession.up.Store(0)
 	torr.trackerSession.down.Store(0)
-	torr.trackerSession.PeerID = torr.session.GeneratePeerID()
+	torr.trackerSession.PeerID = torr.GeneratePeerID()
 	torr.addAnnounce(Announce{
 		InfoHash: torr.Hash,
 		Tracker:  torr.Metainfo.Announce,
@@ -306,7 +329,6 @@ func (torr *Torrent) unchokePeers() {
 			// XXX optimistic unchoking should happen every 30s, while normal unchoking happens every 10s.
 
 			remainder := interested[uploadSlotsPerTorrent-opportunistic:]
-			torr.session.rngMu.Lock()
 			// OPT Shuffling all the peers isn't too expensive and this is fine.
 			// However, if we have way more peers than optimistic unchoke slots,
 			// then generating random, unique indices is much faster,
@@ -318,10 +340,9 @@ func (torr *Torrent) unchokePeers() {
 			// Really, this is fine.
 			// Even if we had millions of peers, this would take less than a second.
 			// For realistic numbers of peers (say, 200), this takes microseconds.
-			torr.session.rng.Shuffle(len(remainder), func(i, j int) {
+			torr.mainRng.Shuffle(len(remainder), func(i, j int) {
 				remainder[i], remainder[j] = remainder[j], remainder[i]
 			})
-			torr.session.rngMu.Unlock()
 			for _, peer := range remainder[:opportunistic] {
 				unchokes = append(unchokes, unchoke{peer.peer, "optimistically"})
 			}
