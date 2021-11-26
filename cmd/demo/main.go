@@ -113,6 +113,10 @@ func main() {
 			case bittorrent.EventAnnounceFailed:
 				log.Printf("announce for %s failed for the %dth time; reason: %s",
 					ev.Announce.InfoHash, len(ev.Announce.Fails), ev.Announce.Fails[len(ev.Announce.Fails)-1].Err)
+			case bittorrent.EventPeerUnchoked:
+				log.Printf("%s: unchoking %s because %q", ev.Torrent, ev.Peer, ev.Reason)
+			case bittorrent.EventPeerChoked:
+				log.Printf("%s: choking %s", ev.Torrent, ev.Peer)
 			default:
 				log.Printf("unhandled event: %v", ev)
 			}

@@ -2,7 +2,6 @@ package bittorrent
 
 import (
 	"fmt"
-	"log"
 	"sort"
 	"sync"
 	"time"
@@ -267,10 +266,12 @@ func (torr *Torrent) unchokePeers() {
 		}
 	}
 
-	log.Printf("%s: %d currently unchoked peers, %d interested peers", torr, len(choke), len(interested))
-
-	// The peers we eventually decided to unchoke
-	unchoke := make([]*Peer, 0, uploadSlotsPerTorrent)
+	type unchoke struct {
+		peer   *Peer
+		reason string
+	}
+	// The peers we eventually decided to unchokes
+	unchokes := make([]unchoke, 0, uploadSlotsPerTorrent)
 
 	torr.stateMu.Lock()
 	state := torr.state
@@ -290,8 +291,7 @@ func (torr *Torrent) unchokePeers() {
 		if len(interested) <= uploadSlotsPerTorrent {
 			// Unchoke all interested peers
 			for _, peer := range interested {
-				log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
-				unchoke = append(unchoke, peer.peer)
+				unchokes = append(unchokes, unchoke{peer.peer, "few peers"})
 			}
 		} else {
 			// Unchoke some peers based on their upload rate to us
@@ -300,8 +300,7 @@ func (torr *Torrent) unchokePeers() {
 				return interested[i].downloaded < interested[j].downloaded
 			})
 			for _, peer := range interested[:uploadSlotsPerTorrent-opportunistic] {
-				log.Printf("%s: unchoking %s because of reciprocation", torr, peer.peer)
-				unchoke = append(unchoke, peer.peer)
+				unchokes = append(unchokes, unchoke{peer.peer, "reciprocation"})
 			}
 
 			// XXX optimistic unchoking should happen every 30s, while normal unchoking happens every 10s.
@@ -324,8 +323,7 @@ func (torr *Torrent) unchokePeers() {
 			})
 			torr.session.rngMu.Unlock()
 			for _, peer := range remainder[:opportunistic] {
-				log.Printf("%s: unchoking %s optimistically", torr, peer.peer)
-				unchoke = append(unchoke, peer.peer)
+				unchokes = append(unchokes, unchoke{peer.peer, "optimistically"})
 			}
 		}
 
@@ -336,8 +334,7 @@ func (torr *Torrent) unchokePeers() {
 		if len(interested) <= uploadSlotsPerTorrent {
 			// Unchoke all interested peers
 			for _, peer := range interested {
-				log.Printf("%s: unchoking %s because we have few peers", torr, peer.peer)
-				unchoke = append(unchoke, peer.peer)
+				unchokes = append(unchokes, unchoke{peer.peer, "few peers"})
 			}
 		} else {
 			// Unchoke peers in a round-robin manner
@@ -345,8 +342,7 @@ func (torr *Torrent) unchokePeers() {
 				return interested[i].peer.lastUnchoke.Before(interested[j].peer.lastUnchoke)
 			})
 			for _, peer := range interested[:uploadSlotsPerTorrent] {
-				log.Printf("%s: unchoking %s because of round-robin", torr, peer.peer)
-				unchoke = append(unchoke, peer.peer)
+				unchokes = append(unchokes, unchoke{peer.peer, "round robin"})
 			}
 		}
 
@@ -355,32 +351,37 @@ func (torr *Torrent) unchokePeers() {
 		return
 	}
 
-	for _, peer := range unchoke {
+	for _, u := range unchokes {
 		// Don't choke peers we want to keep unchoked
-		choke.Delete(peer)
+		choke.Delete(u.peer)
 	}
 
 	actual := 0
-	for _, peer := range unchoke {
-		if peer.amChoking {
+	for _, u := range unchokes {
+		if u.peer.amChoking {
 			actual++
 		}
 	}
-	log.Printf("%s: choking %d peers, unchoking %d peers, %d unchoked peers total", torr, len(choke), actual, len(unchoke))
 
 	// XXX don't block trying to send the control messages to a slow peer
 	for peer := range choke {
 		if err := peer.choke(); err != nil {
 			// XXX kill peer
+		} else {
+			torr.session.addEvent(EventPeerChoked{peer, torr})
 		}
 	}
-	for _, peer := range unchoke {
-		if err := peer.unchoke(); err != nil {
-			// XXX kill peer
+	for _, u := range unchokes {
+		if u.peer.amChoking {
+			if err := u.peer.unchoke(); err != nil {
+				// XXX kill peer
+			} else {
+				torr.session.addEvent(EventPeerUnchoked{u.peer, torr, u.reason})
+			}
 		}
 	}
 
-	torr.numUnchoked = len(unchoke)
+	torr.numUnchoked = len(unchokes)
 }
 
 type ProtocolViolationError struct {
@@ -476,7 +477,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			peer.peerInterested = true
 			if torr.numUnchoked < uploadSlotsPerTorrent {
 				// We have free slots, unchoke the peer immediately.
-				log.Printf("%s: unchoking %s immediately", torr, peer)
+				torr.session.addEvent(EventPeerUnchoked{peer, torr, "immediately"})
 				peer.unchoke()
 				torr.numUnchoked++
 			}
