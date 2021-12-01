@@ -5,9 +5,15 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/container"
 	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
+
+type block struct {
+	piece  uint32
+	offset int
+}
 
 type Peer struct {
 	conn    *protocol.Connection
@@ -19,6 +25,9 @@ type Peer struct {
 
 	// How many outstanding incoming requests the peer accepts
 	maxOutgoingRequests int
+
+	// outstanding requests we've sent the peer
+	curOutgoingRequests container.Set[block]
 
 	// A mapping of extensions to the IDs used by the peer (BEP 10).
 	//
@@ -89,12 +98,12 @@ func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
 		conn:    conn,
 		session: sess,
 		// OPT tweak buffers
-		incomingRequests: make(chan request, 256),
-		writes:           make(chan protocol.Message, 256),
-		controlWrites:    make(chan protocol.Message, 256),
-		done:             make(chan struct{}),
+		incomingRequests:    make(chan request, 256),
+		writes:              make(chan protocol.Message, 256),
+		controlWrites:       make(chan protocol.Message, 256),
+		done:                make(chan struct{}),
+		curOutgoingRequests: container.NewSet[block](),
 
-		have:           NewBitset(),
 		amInterested:   false,
 		amChoking:      true,
 		peerInterested: false,
@@ -287,11 +296,6 @@ func (peer *Peer) run() (err error) {
 	}
 
 	peer.errs = make(chan error, 1)
-
-	if err := torr.startPeer(peer); err != nil {
-		return err
-	}
-
 	msgs := make(chan protocol.Message)
 
 	// OPT multiple reader goroutines?
@@ -301,6 +305,8 @@ func (peer *Peer) run() (err error) {
 	go func() { peer.Kill(peer.blockReader()) }()
 	go func() { peer.Kill(peer.readPeer(msgs)) }()
 	go func() { peer.Kill(peer.writePeer()) }()
+
+	torr.startPeers <- peer
 
 	defer peer.updateStats()
 	trafficTicker := time.NewTicker(peerStatisticsInterval)

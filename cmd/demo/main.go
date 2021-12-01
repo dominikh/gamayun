@@ -38,14 +38,14 @@ func main() {
 	client.Callbacks.PeerDisconnected = func(peer *bittorrent.Peer, err error) {
 		log.Println("Peer disconnected:", peer, err)
 	}
-	client.Callbacks.PeerHandshakeInfoHash = func(peer *bittorrent.Peer, h protocol.InfoHash) bool {
-		log.Printf("Peer %s wants to connect to torrent %s", peer, h)
-		return true
-	}
-	client.Callbacks.PeerHandshakePeerID = func(peer *bittorrent.Peer, id [20]byte) bool {
-		log.Printf("Peer %s wants to connect with peer ID %q", peer, id)
-		return true
-	}
+	// client.Callbacks.PeerHandshakeInfoHash = func(peer *bittorrent.Peer, h protocol.InfoHash) bool {
+	// 	log.Printf("Peer %s wants to connect to torrent %s", peer, h)
+	// 	return true
+	// }
+	// client.Callbacks.PeerHandshakePeerID = func(peer *bittorrent.Peer, id [20]byte) bool {
+	// 	log.Printf("Peer %s wants to connect with peer ID %q", peer, id)
+	// 	return true
+	// }
 	prometheus.DefaultRegisterer.MustRegister(client)
 
 	go func() {
@@ -86,14 +86,15 @@ func main() {
 			log.Println(result, stopped, err)
 			if err != nil {
 				// XXX
+				log.Fatal(err)
 			}
 			if stopped {
 				// XXX
 			} else {
 				torr.SetHave(result.(bittorrent.Bitset))
-				if torr.IsComplete() {
-					torr.Start()
-				}
+				// if torr.IsComplete() {
+				torr.Start()
+				// }
 			}
 		}()
 	}

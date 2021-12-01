@@ -188,7 +188,6 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	}
 
 	torr := NewTorrent(hash, info, sess)
-
 	// XXX ensure the on-disk files are of the right lengths
 
 	// XXX don't require all files in a torrent to always be open. open them lazily.
@@ -205,18 +204,6 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		}
 	}
 	torr.data = &files
-
-	n := uint32(torr.NumPieces())
-	torr.availability = Pieces{
-		pieceIndices:   make([]uint32, n),
-		sortedPieces:   make([]uint32, n),
-		availabilities: make([]uint16, n),
-		buckets:        []uint32{n},
-	}
-	for i := uint32(0); i < n; i++ {
-		torr.availability.pieceIndices[i] = i
-		torr.availability.sortedPieces[i] = i
-	}
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()

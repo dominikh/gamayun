@@ -11,6 +11,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
+const BlockSize = 1 << 14
+
 type InfoHash [20]byte
 
 func (hash InfoHash) String() string { return fmt.Sprintf("%02x", [20]byte(hash)) }

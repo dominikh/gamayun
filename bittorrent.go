@@ -137,33 +137,28 @@ type Bitset struct {
 	// OPT: don't use big.Int. use our own representation that matches
 	// the wire protocol, so that we don't have to convert between the
 	// two all the time
-	bits *big.Int
-}
-
-func NewBitset() Bitset {
-	return Bitset{bits: big.NewInt(0)}
+	bits big.Int
 }
 
 func (set Bitset) Copy() Bitset {
 	nset := Bitset{
 		count: set.count,
-		bits:  big.NewInt(0),
 	}
-	nset.bits.Set(set.bits)
+	nset.bits.Set(&set.bits)
 	return nset
 }
 
-func (set Bitset) Get(piece uint32) bool {
-	return set.bits.Bit(int(piece)) == 1
+func (set Bitset) Get(bit uint32) bool {
+	return set.bits.Bit(int(bit)) == 1
 }
 
-func (set *Bitset) Set(piece uint32) {
-	if set.bits.Bit(int(piece)) == 1 {
+func (set *Bitset) Set(bit uint32) {
+	if set.bits.Bit(int(bit)) == 1 {
 		// Some clients send Have messages for pieces they already announced in the bitfield, and we don't want to count them twice
 		return
 	}
 	set.count++
-	set.bits.SetBit(set.bits, int(piece), 1)
+	set.bits.SetBit(&set.bits, int(bit), 1)
 }
 
 // SetBitfield populates set from a bittorrent bitfield.
@@ -177,24 +172,22 @@ func (set *Bitset) SetBitfield(buf []byte) {
 			bit++
 			if b&1<<n != 0 {
 				set.count++
-				set.bits.SetBit(set.bits, bit, 1)
+				set.bits.SetBit(&set.bits, bit, 1)
 			} else {
-				set.bits.SetBit(set.bits, bit, 0)
+				set.bits.SetBit(&set.bits, bit, 0)
 			}
 		}
 	}
 }
 
-func (set *Bitset) Intersect(other *Bitset) *Bitset {
-	out := &Bitset{
-		bits: big.NewInt(0),
-	}
+func (set Bitset) Intersect(other Bitset) Bitset {
+	out := Bitset{}
 
 	if set.count == 0 || other.count == 0 {
 		return out
 	}
 
-	out.bits.And(set.bits, other.bits)
+	out.bits.And(&set.bits, &other.bits)
 
 	// OPT: we'll call Intersect a lot, and Bytes allocates, so this is no good.
 	// We could use FillBytes, but the loop is still O(n).
@@ -205,8 +198,10 @@ func (set *Bitset) Intersect(other *Bitset) *Bitset {
 }
 
 func (set *Bitset) String() string {
-	return fmt.Sprintf("%d pieces", set.count)
+	return fmt.Sprintf("%d bits set", set.count)
 }
+
+// OPT track HaveAll separately
 
 // OPT don't spread requests for the same piece among many peers, it
 // wastes their disk caches. "The logic in libtorrent switches into
@@ -226,8 +221,6 @@ func (set *Bitset) String() string {
 //
 // TODO: prioritize pieces we've already downloading
 type Pieces struct {
-	mu sync.Mutex
-
 	// mapping from piece to entry in sorted_pieces
 	pieceIndices []uint32
 
@@ -240,55 +233,191 @@ type Pieces struct {
 	// mapping from priority to one past the last item in sorted_pieces that is part of that priority
 	buckets []uint32
 
-	// Number of peers that have all pieces. These aren't tracked in availabilities.
-	haveAll int
+	// Mapping from piece to requested or downloaded blocks. This map
+	// only contains entries for partially downloaded pieces.
+	requestedBlocks map[uint32]*Bitset
+
+	// Mapping from piece to downloaded blocks. This map only contains
+	// entries for partially downloaded pieces.
+	downloadedBlocks map[uint32]*Bitset
+
+	// Pieces we have. These have been hashed and written to disk.
+	have Bitset
+
+	// The size of a single piece, in blocks
+	pieceSize int
 }
 
-func (t *Pieces) pick(peer *Peer, numBlocks int) (piece, start, end int, ok bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+// Half-open interval [start, end) of blocks to request for piece.
+//
+// TODO(dh): give this type a better name
+type blockRange struct {
+	piece      uint32
+	start, end int
+}
+
+// HavePiece records that we have a piece.
+func (t *Pieces) HavePiece(piece uint32) {
+	t.have.Set(piece)
+	delete(t.requestedBlocks, piece)
+	delete(t.downloadedBlocks, piece)
+}
+
+// NeedPiece records that we need a piece. This needs to be called if a downloaded piece failed verification, so that we request it again.
+// This shouldn't be used on a piece that has already been marked as completed by Have.
+func (t *Pieces) NeedPiece(piece uint32) {
+	// TODO(dh): record which peers we got the piece from, try to find out which peer is to blame
+	delete(t.requestedBlocks, piece)
+	delete(t.downloadedBlocks, piece)
+}
+
+func (t *Pieces) HaveBlock(piece uint32, block uint32) (complete bool) {
+	req, ok := t.downloadedBlocks[piece]
+	if !ok {
+		req = new(Bitset)
+		t.downloadedBlocks[piece] = req
+	}
+	req.Set(block)
+	return req.count == t.pieceSize
+}
+
+// TODO(dh): this API cannot support end-game mode
+func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) {
+	// Based on commonly used piece sizes, large torrents have between
+	// 4096 and 24320 pieces. However, every once in a while, someone
+	// uses the default piece size of 128 KiB even for very large
+	// torrents, leading to hundreds of thousands of pieces. The
+	// current implementation of the piece picker is technically
+	// O(pieces) for picking a single piece, and O(pieces²) for
+	// picking all pieces. However, in practice, only a small fraction
+	// of all pieces get looked at.
 
 	if !peer.amInterested {
-		ok = false
-		return
+		panic(fmt.Sprintf("trying to pick piece for peer %s we're not interested in", peer))
 	}
 
 	if peer.have.count == 0 {
-		panic("interested in peer with no pieces")
+		panic(fmt.Sprintf("interested in peer %s with no pieces", peer))
 	}
 
-	if t.availabilities[t.sortedPieces[0]] == 0 && t.haveAll == 0 {
-		panic("peer has pieces but we think nobody has any pieces")
+	if t.availabilities[t.sortedPieces[len(t.sortedPieces)-1]] == 0 {
+		panic(fmt.Sprintf("peer %s has pieces but we think nobody has any pieces", peer))
+	}
+
+	// OPT(dh): when the peer has much fewer pieces than the rest of
+	// the swarm, then it should be faster to loop over the peer's
+	// pieces and return the one with the highest priority. It's the
+	// same O(pieces) because we have to look at each piece to know if
+	// the peer has it, but since that's stored in a bitmap we can
+	// check 64 pieces at a time.
+
+	blocksForPiece := func(piece uint32, max int) (ranges []blockRange, n int) {
+		if max > t.pieceSize {
+			max = t.pieceSize
+		}
+		reqBlocks, ok := t.requestedBlocks[piece]
+		if !ok {
+			reqBlocks = new(Bitset)
+			t.requestedBlocks[piece] = reqBlocks
+		}
+		if reqBlocks.count == 0 {
+			// We haven't requested any blocks of this piece, so we can request from 0 to max
+			ranges = append(ranges, blockRange{piece: piece, start: 0, end: max})
+		} else if reqBlocks.count == t.pieceSize {
+			// We have already requested all blocks in this piece
+		} else {
+			// Find contiguous ranges of blocks to request
+			start := -1
+			for bit := 0; bit < t.pieceSize; bit++ {
+				if max < 0 {
+					panic("max became negative")
+				}
+				if max == 0 {
+					break
+				}
+
+				if reqBlocks.Get(uint32(bit)) {
+					if start != -1 {
+						// End range
+						ranges = append(ranges, blockRange{piece: piece, start: start, end: bit})
+						start = -1
+						max -= bit - start
+					}
+				} else {
+					if start == -1 {
+						// Start range
+						start = bit
+					} else if bit-start == max {
+						// End range early, we've gotten enough blocks
+						ranges = append(ranges, blockRange{piece: piece, start: start, end: bit})
+						start = -1
+						max = 0
+						break
+					}
+				}
+			}
+
+			if start != -1 {
+				// We ran out of blocks, end range
+				ranges = append(ranges, blockRange{piece: piece, start: start, end: t.pieceSize})
+				max -= t.pieceSize - start
+			}
+		}
+
+		n = 0
+		for _, r := range ranges {
+			n += r.end - r.start
+			for bit := r.start; bit < r.end; bit++ {
+				// OPT surely there's a better way than setting each bit individually
+				reqBlocks.Set(uint32(bit))
+			}
+		}
+
+		if len(ranges) > 0 && n == 0 {
+			panic("have ranges but n == 0")
+		}
+		return ranges, n
 	}
 
 	// XXX prefer partial pieces
 	for _, piece := range t.sortedPieces {
-		if peer.have.Get(piece) {
-			// XXX check which blocks we still need, return a contiguous span of those
-			log.Println("fetching piece", piece)
+		if numBlocks < 0 {
+			panic("numBlocks became negative")
 		}
+		if numBlocks == 0 {
+			break
+		}
+
+		// TODO(dh): can we ever reach a piece with zero availability?
+		// I don't think so; we only request from peers that we're
+		// interested in, and we shouldn't be interested in peers that
+		// have no pieces we don't also have.
+
+		// OPT(dh): can we deprioritize pieces that we already have,
+		// by giving them the smallest priority possible? That way
+		// we'll have to iterate over much fewer total pieces. Or can
+		// we just remove them altogether?
+		if t.have.Get(piece) {
+			// Don't pick a piece we already have
+			continue
+		}
+
+		if !peer.have.Get(piece) {
+			// Don't pick a piece the peer doesn't have
+			continue
+		}
+
+		pranges, n := blocksForPiece(piece, numBlocks)
+		ranges = append(ranges, pranges...)
+		numBlocks -= n
 	}
 
-	ok = false
-	return
+	return ranges, len(ranges) != 0
 }
 
-func (t *Pieces) incAll() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.haveAll++
-}
+// XXX add method to mark blocks as still needed
 
-func (t *Pieces) decAll() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.haveAll--
-}
-
-func (t *Pieces) inc(piece uint32) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
+func (t *Pieces) incAvailability(piece uint32) {
 	avail := t.availabilities[piece]
 	t.buckets[avail]--
 	t.availabilities[piece]++
@@ -305,9 +434,8 @@ func (t *Pieces) inc(piece uint32) {
 	}
 }
 
-func (t *Pieces) dec(piece uint32) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *Pieces) decAvailability(piece uint32) {
+	log.Println("dec", piece)
 
 	t.availabilities[piece]--
 	avail := t.availabilities[piece]
@@ -358,7 +486,7 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 	pieceSize := l.Torrent.Metainfo.Info.PieceLength
 	numPieces := l.Torrent.NumPieces()
 
-	res := NewBitset()
+	res := Bitset{}
 
 	// OPT use a normal MultiReader to avoid the unnecessary cost of
 	// mapping from piece to file. We just want to read everything
@@ -495,5 +623,43 @@ func (ds *dataStorage) ReadAt(p []byte, off int64) (int, error) {
 	if n != wantN {
 		return n, io.ErrUnexpectedEOF
 	}
+	return n, nil
+}
+
+func (ds *dataStorage) WriteAt(p []byte, off int64) (int, error) {
+	files := ds.relevantFiles(len(p), off)
+	// How far to skip in the first file.
+	needSkip := off
+	if len(files) > 0 {
+		needSkip -= files[0].Offset
+	}
+
+	n := 0
+	for len(files) > 0 && len(p) > 0 {
+		writeP := p
+		fileSize := files[0].Size
+		if int64(len(writeP)) > fileSize-needSkip {
+			writeP = writeP[:fileSize-needSkip]
+		}
+
+		// OPT(dh): support preallocating files
+		f, err := os.OpenFile(files[0].Path, os.O_WRONLY|os.O_CREATE, 0666)
+		if err != nil {
+			return n, err
+		}
+		rn, err := f.WriteAt(writeP, needSkip)
+		n += rn
+		f.Close()
+		if err != nil {
+			return n, err
+		}
+		pn := len(writeP)
+		p = p[pn:]
+		if int64(pn)+needSkip == fileSize {
+			files = files[1:]
+		}
+		needSkip = 0
+	}
+
 	return n, nil
 }

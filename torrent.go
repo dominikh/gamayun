@@ -2,6 +2,7 @@ package bittorrent
 
 import (
 	"fmt"
+	"math/big"
 	"math/rand"
 	"sort"
 	"sync"
@@ -72,12 +73,12 @@ type Torrent struct {
 	Metainfo *Metainfo
 	Hash     protocol.InfoHash
 
-	availability Pieces
-	data         *dataStorage
-	session      *Session
-	announces    announceQueue[Announce]
-	peerIDRng    lockedRand
-	mainRng      *rand.Rand
+	pieces    Pieces
+	data      *dataStorage
+	session   *Session
+	announces announceQueue[Announce]
+	peerIDRng lockedRand
+	mainRng   *rand.Rand
 
 	// Mutex used to prevent concurrent Start and Stop calls
 	stateMu        sync.Mutex
@@ -88,26 +89,40 @@ type Torrent struct {
 
 	numUnchoked int
 
-	peerMsgs chan peerMessage
-
-	// Pieces we have
-	have Bitset
+	startPeers chan *Peer
+	peerMsgs   chan peerMessage
 }
 
 func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent {
-	return &Torrent{
+	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
 		session:  sess,
-		have:     NewBitset(),
 		peers:    container.NewConcurrentSet[*Peer](),
 		peerIDRng: lockedRand{
 			rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 		},
 		mainRng: rand.New(rand.NewSource(time.Now().UnixNano())),
 		// OPT tweak buffers
-		peerMsgs: make(chan peerMessage, 256),
+		startPeers: make(chan *Peer),
+		peerMsgs:   make(chan peerMessage, 256),
 	}
+	n := uint32(torr.NumPieces())
+	torr.pieces = Pieces{
+		pieceIndices:     make([]uint32, n),
+		sortedPieces:     make([]uint32, n),
+		availabilities:   make([]uint16, n),
+		buckets:          []uint32{n},
+		requestedBlocks:  map[uint32]*Bitset{},
+		downloadedBlocks: map[uint32]*Bitset{},
+		pieceSize:        int(info.Info.PieceLength-1)/protocol.BlockSize + 1,
+	}
+	for i := uint32(0); i < n; i++ {
+		torr.pieces.pieceIndices[i] = i
+		torr.pieces.sortedPieces[i] = i
+	}
+
+	return torr
 }
 
 func (torr *Torrent) GeneratePeerID() [20]byte {
@@ -164,7 +179,6 @@ func (torr *Torrent) Start() {
 		torr.setState(TorrentStateSeeding)
 	} else {
 		torr.setState(TorrentStateLeeching)
-		panic("XXX: we cannot download torrents yet")
 	}
 }
 
@@ -219,11 +233,11 @@ func (torr *Torrent) String() string {
 
 func (torr *Torrent) IsComplete() bool {
 	// XXX locking
-	return torr.have.count == torr.NumPieces()
+	return torr.pieces.have.count == torr.NumPieces()
 }
 
 func (torr *Torrent) SetHave(have Bitset) {
-	torr.have = have
+	torr.pieces.have = have
 }
 
 func (torr *Torrent) NumPieces() int {
@@ -411,6 +425,13 @@ type ProtocolViolationError struct {
 
 func (err ProtocolViolationError) Error() string { return err.reason }
 
+func (peer *Peer) becomeInterested() error {
+	peer.amInterested = true
+	return peer.controlWrite(protocol.Message{
+		Type: protocol.MessageTypeInterested,
+	})
+}
+
 func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 	// TODO: We may still receive messages for a peer even after we've killed it. Should we automatically ignore those messages?
 
@@ -440,7 +461,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 					for n := 7; n >= 0; n-- {
 						bit++
 						if b&1<<n != 0 {
-							torr.availability.inc(uint32(bit))
+							torr.pieces.incAvailability(uint32(bit))
 						}
 					}
 				}
@@ -450,15 +471,20 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 				// OPT more efficient representation for HaveAll
 				for i := 0; i < torr.NumPieces(); i++ {
 					peer.have.Set(uint32(i))
+					torr.pieces.incAvailability(uint32(i))
 				}
-				torr.availability.incAll()
-				defer torr.availability.decAll()
 			case protocol.MessageTypeExtended:
 				// nothing to do for now
 			default:
 				return ProtocolViolationError{fmt.Sprintf("unexpected message %q in peer setup phase", msg)}
 			}
 			peer.setup = true
+
+			var bits big.Int
+			bits.AndNot(&peer.have.bits, &torr.pieces.have.bits)
+			if bits.BitLen() != 0 {
+				return peer.becomeInterested()
+			}
 		}
 	} else {
 		switch msg.Type {
@@ -483,15 +509,12 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 					Length: msg.Length,
 				}
 				if !channel.TrySend(peer.incomingRequests, req) {
-					err := peer.controlWrite(protocol.Message{
+					return peer.controlWrite(protocol.Message{
 						Type:   protocol.MessageTypeRejectRequest,
 						Index:  msg.Index,
 						Begin:  msg.Begin,
 						Length: msg.Length,
 					})
-					if err != nil {
-						return err
-					}
 				}
 			}
 		case protocol.MessageTypeInterested:
@@ -508,39 +531,135 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			// XXX check bounds
 			// XXX ignore Have if we've gotten HaveAll before (or is it a protocol violation?)
 			peer.have.Set(msg.Index)
-			torr.availability.inc(msg.Index)
+			torr.pieces.incAvailability(msg.Index)
 
 			// If we're not yet interested in the peer and we do need this piece, become interested
 			// OPT don't check if we're a seeder
 			if !peer.amInterested {
-				if !torr.have.Get(msg.Index) {
-					err := peer.controlWrite(protocol.Message{
-						Type: protocol.MessageTypeInterested,
-					})
-					if err != nil {
-						return err
-					}
+				if !torr.pieces.have.Get(msg.Index) {
+					return peer.becomeInterested()
 				}
 			}
 		case protocol.MessageTypeChoke:
-			// XXX handle
+			// XXX consider outgoing requests as failed if the peer doesn't support RejectRequest messages
 			peer.peerChoking = true
 		case protocol.MessageTypeUnchoke:
-			// XXX handle
 			peer.peerChoking = false
+			return torr.requestBlocks(peer)
 		case protocol.MessageTypeAllowedFast:
 			// XXX make use of this information
 		case protocol.MessageTypeKeepAlive:
-		// XXX should we respond?
+			// XXX should we respond?
 		case protocol.MessageTypeExtended:
 			// nothing to do for now
 		case protocol.MessageTypeBitfield, protocol.MessageTypeHaveNone, protocol.MessageTypeHaveAll:
 			return ProtocolViolationError{fmt.Sprintf("message %s after peer setup has finished", msg)}
+		case protocol.MessageTypePiece:
+			// XXX validate that we've actually requested this block
+			// XXX validate length
+			// XXX validate that msg.Begin is at a block boundary
+			delete(peer.curOutgoingRequests, block{
+				piece:  msg.Index,
+				offset: int(msg.Begin),
+			})
+			if len(msg.Data) != protocol.BlockSize {
+				// XXX don't panic, kill the peer
+				// XXX handle the final block in the torrent
+				panic(fmt.Sprintf("got %d bytes of data, not BlockSize", len(msg.Data)))
+			}
+			torr.requestBlocks(peer)
+			off := int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength) + int64(msg.Begin)
+			if _, err := torr.data.WriteAt(msg.Data, off); err != nil {
+				// XXX It's not enough to just return an error. That will
+				// just kill the peer, but it's not a problem with the
+				// peer, but with our storage, and we should stop the
+				// torrent.
+				return err
+			}
+			if torr.pieces.HaveBlock(msg.Index, msg.Begin/protocol.BlockSize) {
+				// OPT(dh): move hashing to separate goroutine; we don't need backpressure from hashing.
+				buf := make([]byte, torr.Metainfo.Info.PieceLength)
+				// XXX handle final piece in torrent, which might be shorter
+				_, err := torr.data.ReadAt(buf, int64(msg.Index)*int64(len(buf)))
+				if err != nil {
+					// XXX It's not enough to just return an error. That will
+					// just kill the peer, but it's not a problem with the
+					// peer, but with our storage, and we should stop the
+					// torrent.
+					return err
+				}
+				// TODO(dh): write a helper function for getting the
+				// expected hash of a piece. this is needed in the
+				// Verify action as well as here.
+				off := msg.Index * 20
+				if verifyBlock(buf, torr.Metainfo.Info.Pieces[off:off+20]) {
+					torr.pieces.HavePiece(msg.Index)
+					for otherPeer := range torr.peers.Copy() {
+						// It's possible that a client connects, gets
+						// sent the updated bitfield, then also gets a
+						// Have message from this loop. As far as the
+						// protocol is concerned, this should be fine.
+						err := otherPeer.controlWrite(protocol.Message{
+							Type:  protocol.MessageTypeHave,
+							Index: msg.Index,
+						})
+						if err != nil {
+							otherPeer.Kill(err)
+						}
+					}
+				} else {
+					// TODO(dh): figure out which peers sent us bad data
+					torr.pieces.NeedPiece(msg.Index)
+				}
+			}
+		case protocol.MessageTypeRejectRequest:
+			// XXX validate that we've actually requested this block
+			// XXX handle this, marking blocks as still needed
+		case protocol.MessageTypeSuggestPiece:
+			// TODO(dh): Can we do something useful with this?
 		default:
+			// XXX we're not yet handling all types
 			return ProtocolViolationError{fmt.Sprintf("unexpected message %s", msg)}
 		}
 	}
 
+	return nil
+}
+
+// requestBlocks requests more blocks from a peer if we're running low on outstanding requests.
+func (torr *Torrent) requestBlocks(peer *Peer) error {
+	if !peer.amInterested {
+		return nil
+	}
+	// XXX respect peer.maxOutgoingRequests
+
+	// XXX don't hard-code 10, use bandwidth-latency product
+	if len(peer.curOutgoingRequests) > 10 {
+		return nil
+	}
+
+	// XXX don't hard-code 100, base off bandwidth-latency product
+
+	// XXX if ok == false, the peer has nothing to offer
+	// us, and we should stop being interested. however,
+	// we have to become interested again if requests to
+	// another peer failed for a piece that this peer has.
+	ranges, _ := torr.pieces.Pick(peer, 100-len(peer.curOutgoingRequests))
+	for _, r := range ranges {
+		for i := r.start; i < r.end; i++ {
+			// XXX when requesting the last block of the last piece, the block may be shorter than protocol.BlockSize
+			peer.curOutgoingRequests.Add(block{piece: r.piece, offset: i * protocol.BlockSize})
+			err := peer.controlWrite(protocol.Message{
+				Type:   protocol.MessageTypeRequest,
+				Index:  r.piece,
+				Begin:  uint32(i) * protocol.BlockSize,
+				Length: protocol.BlockSize,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -561,28 +680,29 @@ func (torr *Torrent) startPeer(peer *Peer) error {
 	// We've received their handshake and peer ID and have
 	// sent ours, now tell the peer which pieces we have
 	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
-	if torr.have.count == 0 {
+	if torr.pieces.have.count == 0 {
 		err := peer.controlWrite(protocol.Message{
 			Type: protocol.MessageTypeHaveNone,
 		})
 		if err != nil {
 			return err
 		}
-	} else if torr.have.count == torr.NumPieces() {
+	} else if torr.pieces.have.count == torr.NumPieces() {
 		err := peer.controlWrite(protocol.Message{
 			Type: protocol.MessageTypeHaveAll,
 		})
 		if err != nil {
 			return err
 		}
-	} else if torr.have.count*haveMessageSize < torr.NumPieces()/8 || true {
+	} else if torr.pieces.have.count*haveMessageSize < torr.NumPieces()/8 || true {
 		// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
 		for i := 0; i < torr.NumPieces(); i++ {
-			if torr.have.bits.Bit(i) != 0 {
+			if torr.pieces.have.bits.Bit(i) != 0 {
 				err := peer.controlWrite(protocol.Message{
 					Type:  protocol.MessageTypeHave,
 					Index: uint32(i),
 				})
+
 				if err != nil {
 					return err
 				}
@@ -606,8 +726,7 @@ func (torr *Torrent) removePeer(peer *Peer) {
 		n := bits.BitLen()
 		for i := 0; i < n; i++ {
 			if bits.Bit(n) != 0 {
-				// XXX handle haveAll
-				torr.availability.dec(uint32(n))
+				torr.pieces.decAvailability(uint32(n))
 			}
 		}
 	}
@@ -630,6 +749,10 @@ func (torr *Torrent) run() {
 				if err := torr.handlePeerMessage(pmsg.peer, pmsg.msg); err != nil {
 					pmsg.peer.Kill(err)
 				}
+			}
+		case peer := <-torr.startPeers:
+			if err := torr.startPeer(peer); err != nil {
+				peer.Kill(err)
 			}
 		}
 	}
