@@ -154,11 +154,18 @@ func (set Bitset) Get(bit uint32) bool {
 
 func (set *Bitset) Set(bit uint32) {
 	if set.bits.Bit(int(bit)) == 1 {
-		// Some clients send Have messages for pieces they already announced in the bitfield, and we don't want to count them twice
 		return
 	}
 	set.count++
 	set.bits.SetBit(&set.bits, int(bit), 1)
+}
+
+func (set *Bitset) Unset(bit uint32) {
+	if set.bits.Bit(int(bit)) == 0 {
+		return
+	}
+	set.count--
+	set.bits.SetBit(&set.bits, int(bit), 0)
 }
 
 // SetBitfield populates set from a bittorrent bitfield.
@@ -269,6 +276,17 @@ func (t *Pieces) NeedPiece(piece uint32) {
 	// TODO(dh): record which peers we got the piece from, try to find out which peer is to blame
 	delete(t.requestedBlocks, piece)
 	delete(t.downloadedBlocks, piece)
+}
+
+func (t *Pieces) NeedBlock(piece uint32, block uint32) {
+	req, ok := t.requestedBlocks[piece]
+	if !ok {
+		panic(fmt.Sprintf("called NeedBlock(%d, %d), but piece %d doesn't have any currently requested blocks", piece, block, piece))
+	}
+	if req.bits.Bit(int(block)) == 0 {
+		panic(fmt.Sprintf("called NeedBlock(%d, %d), but block %d wasn't requested", piece, block, block))
+	}
+	req.Unset(block)
 }
 
 func (t *Pieces) HaveBlock(piece uint32, block uint32) (complete bool) {

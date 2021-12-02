@@ -631,6 +631,7 @@ func (torr *Torrent) requestBlocks(peer *Peer) error {
 	if !peer.amInterested {
 		return nil
 	}
+
 	// XXX respect peer.maxOutgoingRequests
 
 	// XXX don't hard-code 10, use bandwidth-latency product
@@ -728,6 +729,10 @@ func (torr *Torrent) removePeer(peer *Peer) {
 			if bits.Bit(n) != 0 {
 				torr.pieces.decAvailability(uint32(n))
 			}
+		}
+
+		for b := range peer.curOutgoingRequests {
+			torr.pieces.NeedBlock(b.piece, uint32(b.offset/protocol.BlockSize))
 		}
 	}
 }
