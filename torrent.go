@@ -440,6 +440,13 @@ func (peer *Peer) becomeInterested() error {
 	})
 }
 
+func (peer *Peer) stopBeingInterested() error {
+	peer.amInterested = false
+	return peer.controlWrite(protocol.Message{
+		Type: protocol.MessageTypeNotInterested,
+	})
+}
+
 func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 	// TODO: We may still receive messages for a peer even after we've killed it. Should we automatically ignore those messages?
 
@@ -613,6 +620,18 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 						})
 						if err != nil {
 							otherPeer.Kill(err)
+						}
+
+						// OPT(dh): batch these updates. checking all peers every time we receive a piece wastes a lot of CPU cycles
+						if otherPeer.amInterested {
+							var bits big.Int
+							bits.AndNot(&otherPeer.have.bits, &torr.pieces.have.bits)
+							if bits.BitLen() == 0 {
+								err := otherPeer.stopBeingInterested()
+								if err != nil {
+									otherPeer.Kill(err)
+								}
+							}
 						}
 					}
 				} else {
