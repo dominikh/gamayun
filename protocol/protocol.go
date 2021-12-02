@@ -11,6 +11,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
+// OPT(dh): reuse buffers for writing messages
+
 const BlockSize = 1 << 14
 
 type InfoHash [20]byte
@@ -42,8 +44,7 @@ const (
 type Connection struct {
 	Conn net.Conn
 
-	readBuf  []byte
-	writeBuf [][handshakeLength]byte
+	readBuf []byte
 
 	// OPT(dh): use bitfield for extensions
 	HasFastPeers         bool
@@ -76,13 +77,11 @@ func NewConnection(conn net.Conn) *Connection {
 	return &Connection{
 		Conn:    conn,
 		readBuf: make([]byte, 32*1024+12),
-		// XXX "128" is shared between WriteMessages and runPeerUpload. make this more dynamic
-		writeBuf: make([][handshakeLength]byte, 128),
 	}
 }
 
 func (conn *Connection) SendHandshake(infoHash, peerID [20]byte) error {
-	b := conn.writeBuf[0]
+	var b [handshakeLength]byte
 
 	var reserved [8]byte
 	reserved[7] |= 0x04 // BEP 6, Fast Extension
@@ -301,11 +300,8 @@ func (msg Message) Size() int {
 func (conn *Connection) WriteMessages(msgs []Message) error {
 	bufs := make(net.Buffers, 0, len(msgs))
 
-	sbs := conn.writeBuf
-	for i, msg := range msgs {
-		// sb := conn.writeBuf
-
-		sb := sbs[i]
+	for _, msg := range msgs {
+		var sb [handshakeLength]byte
 		switch msg.Type {
 		case MessageTypeKeepAlive:
 			bufs = append(bufs, sb[:4])

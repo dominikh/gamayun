@@ -1,7 +1,7 @@
 package bittorrent
 
 import (
-	"log"
+	"sync"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -12,7 +12,21 @@ import (
 
 type block struct {
 	piece  uint32
-	offset int
+	offset uint32
+	length uint32
+}
+
+type peerState struct {
+	amInterested bool
+	amChoking    bool
+
+	// these values are transient and get cleared when writing them to the peer
+	weHave   Bitset
+	request  []block
+	reject   []block
+	haveNone bool
+	haveAll  bool
+	bitfield Bitset
 }
 
 type Peer struct {
@@ -40,6 +54,11 @@ type Peer struct {
 		utMetadata  int
 	}
 
+	desiredMu      sync.Mutex
+	desiredState   peerState
+	desiredUpdated chan struct{}
+	currentState   peerState
+
 	// mutable, but doesn't need locking
 	// Pieces the peer has
 	have Bitset
@@ -47,8 +66,6 @@ type Peer struct {
 	setup   bool
 	Torrent *Torrent // XXX make sure this doesn't need locking, now that it is exported
 
-	amChoking      bool
-	amInterested   bool
 	peerChoking    bool
 	peerInterested bool
 
@@ -81,8 +98,7 @@ type Peer struct {
 
 	// Messages to write to the peer.
 	// Several places send to it, Peer.writePeer reads from it.
-	controlWrites chan protocol.Message
-	writes        chan protocol.Message
+	writes chan protocol.Message
 
 	// A buffered channel that can hold one error.
 	// It is used to communicate a fatal error to Peer.run.
@@ -100,12 +116,16 @@ func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
 		// OPT tweak buffers
 		incomingRequests:    make(chan request, 256),
 		writes:              make(chan protocol.Message, 256),
-		controlWrites:       make(chan protocol.Message, 256),
 		done:                make(chan struct{}),
 		curOutgoingRequests: container.NewSet[block](),
 
-		amInterested:   false,
-		amChoking:      true,
+		desiredUpdated: make(chan struct{}, 1),
+		desiredState: peerState{
+			amChoking: true,
+		},
+		currentState: peerState{
+			amChoking: true,
+		},
 		peerInterested: false,
 		peerChoking:    true,
 	}
@@ -114,17 +134,6 @@ func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
 func (peer *Peer) write(msg protocol.Message) error {
 	select {
 	case peer.writes <- msg:
-		return nil
-	case <-peer.done:
-		return nil
-	case <-peer.session.closing:
-		return ErrClosing
-	}
-}
-
-func (peer *Peer) controlWrite(msg protocol.Message) error {
-	select {
-	case peer.controlWrites <- msg:
 		return nil
 	case <-peer.done:
 		return nil
@@ -205,28 +214,191 @@ func (peer *Peer) readPeer(sendTo chan<- protocol.Message) error {
 	}
 }
 
+func (peer *Peer) BecomeInterested() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	if !peer.desiredState.amInterested {
+		peer.desiredState.amInterested = true
+		channel.TrySend(peer.desiredUpdated, struct{}{})
+	}
+}
+
+func (peer *Peer) BecomeUninterested() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	if peer.desiredState.amInterested {
+		peer.desiredState.amInterested = false
+		channel.TrySend(peer.desiredUpdated, struct{}{})
+	}
+}
+
+func (peer *Peer) RejectRequest(index, begin, length uint32) {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	peer.desiredState.reject = append(peer.desiredState.reject, block{index, begin, length})
+	channel.TrySend(peer.desiredUpdated, struct{}{})
+}
+
+func (peer *Peer) Request(index, begin, length uint32) {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	peer.desiredState.request = append(peer.desiredState.request, block{index, begin, length})
+	channel.TrySend(peer.desiredUpdated, struct{}{})
+}
+
+func (peer *Peer) Have(index uint32) {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	peer.desiredState.weHave.Set(index)
+	channel.TrySend(peer.desiredUpdated, struct{}{})
+}
+
+func (peer *Peer) HaveAll() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	peer.desiredState.haveAll = false
+	channel.TrySend(peer.desiredUpdated, struct{}{})
+}
+
+func (peer *Peer) HaveNone() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	peer.desiredState.haveNone = false
+	channel.TrySend(peer.desiredUpdated, struct{}{})
+}
+
+func (peer *Peer) Choke() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	if !peer.desiredState.amChoking {
+		peer.desiredState.amChoking = true
+		channel.TrySend(peer.desiredUpdated, struct{}{})
+	}
+}
+
+func (peer *Peer) Unchoke() {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	if peer.desiredState.amChoking {
+		peer.desiredState.amChoking = false
+		channel.TrySend(peer.desiredUpdated, struct{}{})
+	}
+}
+
+func (peer *Peer) AmChoking() bool {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	return peer.desiredState.amChoking
+}
+
+func (peer *Peer) AmInterested() bool {
+	peer.desiredMu.Lock()
+	defer peer.desiredMu.Unlock()
+	return peer.desiredState.amInterested
+}
+
 func (peer *Peer) writePeer() error {
 	writeMsg := func(msg protocol.Message) error {
 		peer.session.statistics.uploadedRaw.Add(uint64(msg.Size()))
 		peer.statistics.uploaded.Add(uint64(msg.Size()))
 		return peer.conn.WriteMessage(msg)
 	}
+	writeMsgs := func(msgs []protocol.Message) error {
+		for _, msg := range msgs {
+			peer.session.statistics.uploadedRaw.Add(uint64(msg.Size()))
+			peer.statistics.uploaded.Add(uint64(msg.Size()))
+		}
+		return peer.conn.WriteMessages(msgs)
+	}
 
 	for {
-		if msg, ok := channel.TryRecv(peer.controlWrites); ok {
-			// OPT use channel.Collect
-			if err := writeMsg(msg); err != nil {
-				return err
-			}
-		}
 		select {
-		case msg := <-peer.controlWrites:
-			// OPT use channel.Collect
-			if err := writeMsg(msg); err != nil {
+		case <-peer.desiredUpdated:
+			peer.desiredMu.Lock()
+			desired := peer.desiredState
+			// OPT(dh): double buffer the slices
+			peer.desiredState.request = nil
+			peer.desiredState.reject = nil
+			peer.desiredState.haveAll = false
+			peer.desiredState.haveNone = false
+			peer.desiredState.bitfield = Bitset{}
+			peer.desiredState.weHave = Bitset{}
+			peer.desiredMu.Unlock()
+
+			// OPT(dh): reuse slice
+			var msgs []protocol.Message
+
+			if desired.haveNone {
+				msgs = append(msgs, protocol.Message{
+					Type: protocol.MessageTypeHaveNone,
+				})
+			}
+			if desired.haveAll {
+				msgs = append(msgs, protocol.Message{
+					Type: protocol.MessageTypeHaveAll,
+				})
+			}
+			if desired.bitfield.count > 0 {
+				// XXX
+				panic("not implemented")
+			}
+			if desired.amInterested != peer.currentState.amInterested {
+				if desired.amInterested {
+					msgs = append(msgs, protocol.Message{
+						Type: protocol.MessageTypeInterested,
+					})
+				} else {
+					msgs = append(msgs, protocol.Message{
+						Type: protocol.MessageTypeNotInterested,
+					})
+				}
+				peer.currentState.amInterested = desired.amInterested
+			}
+			if desired.amChoking != peer.currentState.amChoking {
+				if desired.amChoking {
+					msgs = append(msgs, protocol.Message{
+						Type: protocol.MessageTypeChoke,
+					})
+				} else {
+					msgs = append(msgs, protocol.Message{
+						Type: protocol.MessageTypeUnchoke,
+					})
+				}
+			}
+			n := uint32(desired.weHave.bits.BitLen())
+			for i := uint32(0); i < n; i++ {
+				if desired.weHave.Get(i) {
+					msgs = append(msgs, protocol.Message{
+						Type:  protocol.MessageTypeHave,
+						Index: i,
+					})
+				}
+			}
+			for _, req := range desired.request {
+				msgs = append(msgs, protocol.Message{
+					Type:   protocol.MessageTypeRequest,
+					Index:  req.piece,
+					Begin:  req.offset,
+					Length: req.length,
+				})
+			}
+			for _, rej := range desired.reject {
+				msgs = append(msgs, protocol.Message{
+					Type:   protocol.MessageTypeRejectRequest,
+					Index:  rej.piece,
+					Begin:  rej.offset,
+					Length: rej.length,
+				})
+			}
+
+			if err := writeMsgs(msgs); err != nil {
 				return err
 			}
 		case msg := <-peer.writes:
-			// OPT use channel.Collect
+			// OPT(dh): we could use channel.Collect here, but not
+			// with an unconditional size of 256 elements. That would
+			// mean 4 MiB of data, which can be seconds worth of data
+			// for some users.
 			if err := writeMsg(msg); err != nil {
 				return err
 			}
@@ -322,36 +494,6 @@ func (peer *Peer) run() (err error) {
 			peer.updateStats()
 		}
 	}
-}
-
-func (peer *Peer) choke() error {
-	if peer.amChoking {
-		return nil
-	}
-
-	log.Println("choking", peer)
-	peer.lastUnchoke = time.Now()
-	peer.amChoking = true
-
-	// XXX don't block trying to send the control message to a slow peer
-	return peer.controlWrite(protocol.Message{
-		Type: protocol.MessageTypeChoke,
-	})
-}
-
-func (peer *Peer) unchoke() error {
-	if !peer.amChoking {
-		return nil
-	}
-
-	log.Println("unchoking", peer)
-	peer.amChoking = false
-	peer.lastUnchoke = time.Now()
-
-	// XXX don't block trying to send the control message to a slow peer
-	return peer.controlWrite(protocol.Message{
-		Type: protocol.MessageTypeUnchoke,
-	})
 }
 
 // Close closes the peer connection and waits for Peer.run to return.

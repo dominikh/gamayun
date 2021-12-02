@@ -310,7 +310,7 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 	// picking all pieces. However, in practice, only a small fraction
 	// of all pieces get looked at.
 
-	if !peer.amInterested {
+	if !peer.AmInterested() {
 		panic(fmt.Sprintf("trying to pick piece for peer %s we're not interested in", peer))
 	}
 
@@ -681,3 +681,9 @@ func (ds *dataStorage) WriteAt(p []byte, off int64) (int, error) {
 
 	return n, nil
 }
+
+// OPT(dh): replace (*big.Int).AndNot with function that returns true or false
+
+// XXX switch torrent into seeding state once we've downloaded the last piece
+// XXX time out block requests
+// XXX kill stalled peers
