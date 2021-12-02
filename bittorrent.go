@@ -358,8 +358,8 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 					if start != -1 {
 						// End range
 						ranges = append(ranges, blockRange{piece: piece, start: start, end: bit})
-						start = -1
 						max -= bit - start
+						start = -1
 					}
 				} else {
 					if start == -1 {
