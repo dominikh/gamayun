@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -61,7 +62,7 @@ func (q *announceQueue[T]) ReplaceFront(el T) {
 }
 
 //go:generate go run golang.org/x/tools/cmd/stringer@master -type TorrentState
-type TorrentState uint8
+type TorrentState uint32
 
 const (
 	TorrentStateStopped TorrentState = iota
@@ -198,7 +199,7 @@ func (torr *Torrent) updatePrometheusState(state TorrentState, delta uint64) {
 func (torr *Torrent) setState(state TorrentState) {
 	torr.updatePrometheusState(torr.state, ^uint64(0))
 	torr.updatePrometheusState(state, 1)
-	torr.state = state
+	atomic.StoreUint32((*uint32)(&torr.state), uint32(state))
 }
 
 func (torr *Torrent) Stop() {
@@ -310,9 +311,16 @@ func (torr *Torrent) unchokePeers() {
 	// The peers we eventually decided to unchokes
 	unchokes := make([]unchoke, 0, uploadSlotsPerTorrent)
 
-	torr.stateMu.Lock()
-	state := torr.state
-	torr.stateMu.Unlock()
+	// We use an atomic load instead of locking stateMu because of the
+	// following possible deadlock: Torrent.Stop holds stateMu and
+	// calls peer.Close. Closing a peer needs to send a message to be
+	// received by Torrent.run, but Torrent.run would be stuck in
+	// unchokePeers trying to obtain stateMu.
+	//
+	// Since we're not concerned about the state changing while in
+	// unchokePeers, and we only want to read the current state, we
+	// don't need to hold the lock.
+	state := TorrentState(atomic.LoadUint32((*uint32)(&torr.state)))
 
 	switch state {
 	case TorrentStateLeeching:
