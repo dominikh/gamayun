@@ -2,7 +2,6 @@ package bittorrent
 
 import (
 	"fmt"
-	"log"
 	"math/big"
 	"math/rand"
 	"sort"
@@ -523,7 +522,6 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			// XXX validate that we've actually requested this block
 			// XXX validate length
 			// XXX validate that msg.Begin is at a block boundary
-			log.Println(peer, "received", msg.Index, msg.Begin, len(msg.Data))
 			delete(peer.curOutgoingRequests, Request{
 				Piece:  msg.Index,
 				Begin:  msg.Begin,
@@ -578,7 +576,6 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 		case protocol.MessageTypeRejectRequest:
 			// XXX validate that we've actually requested this block
 			// XXX kill peer that continuously rejects all our requests
-			log.Println(peer, "rejected", msg.Index, msg.Begin, msg.Length)
 			peer.curOutgoingRequests.Delete(Request{msg.Index, msg.Begin, msg.Length})
 			b := torr.pieces.RequestToBlock(Request{
 				Piece:  msg.Index,
@@ -622,7 +619,6 @@ func (torr *Torrent) requestBlocks(peer *Peer) {
 	for _, r := range ranges {
 		for i := r.start; i < r.end; i++ {
 			req := torr.pieces.BlockToRequest(Block{Piece: r.piece, Block: uint32(i)})
-			log.Println(peer, "we request", req)
 			peer.curOutgoingRequests.Add(req) // XXX should we move this line of code into peer.Request?
 			peer.Request(req)
 		}
@@ -680,7 +676,6 @@ func (torr *Torrent) removePeer(peer *Peer) {
 		}
 
 		for req := range peer.curOutgoingRequests {
-			log.Println(peer, "disconnected", req.Piece, req.Begin, req.Length)
 			torr.pieces.NeedBlock(torr.pieces.RequestToBlock(req))
 		}
 	}
