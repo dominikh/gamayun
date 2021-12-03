@@ -589,7 +589,9 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			}
 		case protocol.MessageTypeRejectRequest:
 			// XXX validate that we've actually requested this block
-			// XXX handle this, marking blocks as still needed
+			// XXX handle final block in final piece
+			peer.curOutgoingRequests.Delete(block{msg.Index, msg.Begin, protocol.BlockSize})
+			torr.pieces.NeedBlock(msg.Index, msg.Begin/protocol.BlockSize)
 		case protocol.MessageTypeSuggestPiece:
 			// TODO(dh): Can we do something useful with this?
 		default:
