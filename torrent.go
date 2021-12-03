@@ -233,7 +233,6 @@ func (torr *Torrent) String() string {
 }
 
 func (torr *Torrent) IsComplete() bool {
-	// XXX locking
 	return torr.pieces.have.count == torr.NumPieces()
 }
 

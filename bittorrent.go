@@ -46,17 +46,6 @@ package bittorrent
 
 // TODO can we write to sockets without having to copy data from user space to kernel space?
 
-// XXX have per-torrent peer ID
-
-// XXX there is a possible deadlock in the protocol: the peer keeps
-// sending us requests, we keep sending rejects. If our control write
-// queue fills up, we'll block and stop reading messages, causing the
-// peer's write queue to also fill up. Now neither client can make
-// progress.
-//
-// This will probably only ever occur with misbehaving clients; sane
-// clients won't flood us with requests.
-
 // XXX handle read/write timeouts, both on disk i/o and network i/o
 
 // XXX set user agent for HTTP requests
@@ -432,8 +421,6 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 
 	return ranges, len(ranges) != 0
 }
-
-// XXX add method to mark blocks as still needed
 
 func (t *Pieces) incAvailability(piece uint32) {
 	avail := t.availabilities[piece]

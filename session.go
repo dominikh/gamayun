@@ -188,9 +188,6 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 	}
 
 	torr := NewTorrent(hash, info, sess)
-	// XXX ensure the on-disk files are of the right lengths
-
-	// XXX don't require all files in a torrent to always be open. open them lazily.
 
 	var files dataStorage
 	if len(info.Info.Files) == 0 {
@@ -341,10 +338,6 @@ func (sess *Session) Run() error {
 }
 
 func (sess *Session) Shutdown(ctx context.Context) error {
-	// XXX close all the files in all the torrents. although, once we
-	// have lazy file opening, this should happen in Torrent.Stop
-	// instead.
-
 	log.Println("Shutting down")
 	defer log.Println("Shut down")
 

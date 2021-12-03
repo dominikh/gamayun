@@ -379,8 +379,7 @@ func (conn *Connection) WriteMessages(msgs []Message) error {
 }
 
 func (conn *Connection) WriteMessage(msg Message) error {
-	// XXX add locking
-
+	// OPT(dh): make sure this doesn't allocate because of the slice
 	return conn.WriteMessages([]Message{msg})
 }
 
