@@ -165,14 +165,17 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("invalid scheme %q in announce URL %q", u.Scheme, info.Announce)
 	}
-	if info.Info.PieceLength < 1<<14 {
-		return fmt.Errorf("piece size %d is too small, has to be at least 16 KiB", info.Info.PieceLength)
+	if info.Info.PieceLength%protocol.MaxBlockSize != 0 {
+		return fmt.Errorf("piece size %d is not a multiple of 16 KiB", info.Info.PieceLength)
 	}
 	if int64(len(info.Info.Pieces)) != 20*numPieces {
 		return fmt.Errorf("got %d bytes of hashes, expected %d", len(info.Info.Pieces), 20*numPieces)
 	}
 	if info.Info.Name == "" {
 		return fmt.Errorf("invalid filename %q", info.Info.Name)
+	}
+	if info.NumBytes() == 0 {
+		return fmt.Errorf("torrent has no pieces")
 	}
 	return nil
 	// XXX prevent directory traversal in info.Info.Name

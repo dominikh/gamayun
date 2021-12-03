@@ -95,8 +95,6 @@ type Torrent struct {
 }
 
 func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent {
-	// XXX reject torrents with zero pieces
-
 	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
@@ -229,13 +227,17 @@ func (torr *Torrent) SetHave(have Bitset) {
 }
 
 func (torr *Torrent) NumBytes() int64 {
+	return torr.Metainfo.NumBytes()
+}
+
+func (info *Metainfo) NumBytes() int64 {
 	var a int64
-	if len(torr.Metainfo.Info.Files) == 0 {
+	if len(info.Info.Files) == 0 {
 		// single-file mode
-		a = torr.Metainfo.Info.Length
+		a = info.Info.Length
 	} else {
 		// multi-file mode
-		for _, f := range torr.Metainfo.Info.Files {
+		for _, f := range info.Info.Files {
 			a += f.Length
 		}
 	}
