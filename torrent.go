@@ -2,6 +2,7 @@ package bittorrent
 
 import (
 	"fmt"
+	"log"
 	"math/big"
 	"math/rand"
 	"sort"
@@ -95,6 +96,8 @@ type Torrent struct {
 }
 
 func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent {
+	// XXX reject torrents with zero pieces
+
 	torr := &Torrent{
 		Metainfo: info,
 		Hash:     hash,
@@ -108,21 +111,7 @@ func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent 
 		startPeers: make(chan *Peer),
 		peerMsgs:   make(chan peerMessage, 256),
 	}
-	n := uint32(torr.NumPieces())
-	torr.pieces = Pieces{
-		pieceIndices:     make([]uint32, n),
-		sortedPieces:     make([]uint32, n),
-		availabilities:   make([]uint16, n),
-		buckets:          []uint32{n},
-		requestedBlocks:  map[uint32]*Bitset{},
-		downloadedBlocks: map[uint32]*Bitset{},
-		pieceSize:        int(info.Info.PieceLength-1)/protocol.BlockSize + 1,
-	}
-	for i := uint32(0); i < n; i++ {
-		torr.pieces.pieceIndices[i] = i
-		torr.pieces.sortedPieces[i] = i
-	}
-
+	torr.pieces = NewPieces(torr)
 	return torr
 }
 
@@ -240,7 +229,7 @@ func (torr *Torrent) SetHave(have Bitset) {
 	torr.pieces.have = have
 }
 
-func (torr *Torrent) NumPieces() int {
+func (torr *Torrent) NumBytes() int64 {
 	var a int64
 	if len(torr.Metainfo.Info.Files) == 0 {
 		// single-file mode
@@ -251,10 +240,13 @@ func (torr *Torrent) NumPieces() int {
 			a += f.Length
 		}
 	}
+	return a
+}
 
+func (torr *Torrent) NumPieces() int {
+	a := torr.NumBytes()
 	b := torr.Metainfo.Info.PieceLength
-	// XXX theoretically, this can overflow. practically it never will
-	return int((a + b - 1) / b)
+	return int(mymath.DivUp(a, b))
 }
 
 func (torr *Torrent) RunAction(l Action) (interface{}, bool, error) {
@@ -483,8 +475,8 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			if peer.AmChoking() {
 				peer.RejectRequest(msg.Index, msg.Begin, msg.Length)
 			} else {
-				req := request{
-					Index:  msg.Index,
+				req := Request{
+					Piece:  msg.Index,
 					Begin:  msg.Begin,
 					Length: msg.Length,
 				}
@@ -531,17 +523,12 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			// XXX validate that we've actually requested this block
 			// XXX validate length
 			// XXX validate that msg.Begin is at a block boundary
-			delete(peer.curOutgoingRequests, block{
-				piece:  msg.Index,
-				offset: msg.Begin,
-				// XXX handle final block, which is shorter
-				length: protocol.BlockSize,
+			log.Println(peer, "received", msg.Index, msg.Begin, len(msg.Data))
+			delete(peer.curOutgoingRequests, Request{
+				Piece:  msg.Index,
+				Begin:  msg.Begin,
+				Length: uint32(len(msg.Data)),
 			})
-			if len(msg.Data) != protocol.BlockSize {
-				// XXX don't panic, kill the peer
-				// XXX handle the final block in the torrent
-				panic(fmt.Sprintf("got %d bytes of data, not BlockSize", len(msg.Data)))
-			}
 			torr.requestBlocks(peer)
 			off := int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength) + int64(msg.Begin)
 			if _, err := torr.data.WriteAt(msg.Data, off); err != nil {
@@ -551,11 +538,10 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 				// torrent.
 				return err
 			}
-			if torr.pieces.HaveBlock(msg.Index, msg.Begin/protocol.BlockSize) {
+			if torr.pieces.HaveBlock(msg.Index, msg.Begin/protocol.MaxBlockSize) {
 				// OPT(dh): move hashing to separate goroutine; we don't need backpressure from hashing.
-				buf := make([]byte, torr.Metainfo.Info.PieceLength)
-				// XXX handle final piece in torrent, which might be shorter
-				_, err := torr.data.ReadAt(buf, int64(msg.Index)*int64(len(buf)))
+				buf := make([]byte, torr.pieces.BytesInPiece(msg.Index))
+				_, err := torr.data.ReadAt(buf, int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength))
 				if err != nil {
 					// XXX It's not enough to just return an error. That will
 					// just kill the peer, but it's not a problem with the
@@ -591,10 +577,15 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			}
 		case protocol.MessageTypeRejectRequest:
 			// XXX validate that we've actually requested this block
-			// XXX handle final block in final piece
 			// XXX kill peer that continuously rejects all our requests
-			peer.curOutgoingRequests.Delete(block{msg.Index, msg.Begin, protocol.BlockSize})
-			torr.pieces.NeedBlock(msg.Index, msg.Begin/protocol.BlockSize)
+			log.Println(peer, "rejected", msg.Index, msg.Begin, msg.Length)
+			peer.curOutgoingRequests.Delete(Request{msg.Index, msg.Begin, msg.Length})
+			b := torr.pieces.RequestToBlock(Request{
+				Piece:  msg.Index,
+				Begin:  msg.Begin,
+				Length: msg.Length,
+			})
+			torr.pieces.NeedBlock(b)
 			torr.requestBlocks(peer)
 		case protocol.MessageTypeSuggestPiece:
 			// TODO(dh): Can we do something useful with this?
@@ -614,7 +605,7 @@ func (torr *Torrent) requestBlocks(peer *Peer) {
 	}
 
 	// Assuming an end-to-end latency of 1s, send enough requests to saturate twice the current download rate.
-	target := int(((peer.DownloadSpeed() * 2) / protocol.BlockSize) + 1)
+	target := int(((peer.DownloadSpeed() * 2) / protocol.MaxBlockSize) + 1)
 	if target < 0 || target > peer.maxOutgoingRequests {
 		target = peer.maxOutgoingRequests
 	}
@@ -630,9 +621,10 @@ func (torr *Torrent) requestBlocks(peer *Peer) {
 	ranges, _ := torr.pieces.Pick(peer, target-len(peer.curOutgoingRequests))
 	for _, r := range ranges {
 		for i := r.start; i < r.end; i++ {
-			// XXX when requesting the last block of the last piece, the block may be shorter than protocol.BlockSize
-			peer.curOutgoingRequests.Add(block{piece: r.piece, offset: uint32(i) * protocol.BlockSize, length: protocol.BlockSize})
-			peer.Request(r.piece, uint32(i)*protocol.BlockSize, protocol.BlockSize)
+			req := torr.pieces.BlockToRequest(Block{Piece: r.piece, Block: uint32(i)})
+			log.Println(peer, "we request", req)
+			peer.curOutgoingRequests.Add(req) // XXX should we move this line of code into peer.Request?
+			peer.Request(req)
 		}
 	}
 }
@@ -687,8 +679,9 @@ func (torr *Torrent) removePeer(peer *Peer) {
 			}
 		}
 
-		for b := range peer.curOutgoingRequests {
-			torr.pieces.NeedBlock(b.piece, uint32(b.offset/protocol.BlockSize))
+		for req := range peer.curOutgoingRequests {
+			log.Println(peer, "disconnected", req.Piece, req.Begin, req.Length)
+			torr.pieces.NeedBlock(torr.pieces.RequestToBlock(req))
 		}
 	}
 }

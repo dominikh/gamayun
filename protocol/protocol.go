@@ -13,7 +13,7 @@ import (
 
 // OPT(dh): reuse buffers for writing messages
 
-const BlockSize = 1 << 14
+const MaxBlockSize = 1 << 14
 
 type InfoHash [20]byte
 

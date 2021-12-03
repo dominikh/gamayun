@@ -11,10 +11,10 @@ import (
 	"honnef.co/go/bittorrent/protocol"
 )
 
-type block struct {
-	piece  uint32
-	offset uint32
-	length uint32
+type Request struct {
+	Piece  uint32
+	Begin  uint32
+	Length uint32
 }
 
 type peerState struct {
@@ -23,8 +23,8 @@ type peerState struct {
 
 	// these values are transient and get cleared when writing them to the peer
 	weHave   Bitset
-	request  []block
-	reject   []block
+	request  []Request
+	reject   []Request
 	haveNone bool
 	haveAll  bool
 	bitfield Bitset
@@ -42,7 +42,7 @@ type Peer struct {
 	maxOutgoingRequests int
 
 	// outstanding requests we've sent the peer
-	curOutgoingRequests container.Set[block]
+	curOutgoingRequests container.Set[Request]
 
 	// A mapping of extensions to the IDs used by the peer (BEP 10).
 	//
@@ -98,7 +98,7 @@ type Peer struct {
 
 	// Incoming requests from this peer.
 	// Torrent.run sends to it, Peer.blockReader reads from it.
-	incomingRequests chan request
+	incomingRequests chan Request
 
 	// Messages to write to the peer.
 	// Several places send to it, Peer.writePeer reads from it.
@@ -118,10 +118,10 @@ func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
 		conn:    conn,
 		session: sess,
 		// OPT tweak buffers
-		incomingRequests:    make(chan request, 256),
+		incomingRequests:    make(chan Request, 256),
 		writes:              make(chan protocol.Message, 256),
 		done:                make(chan struct{}),
-		curOutgoingRequests: container.NewSet[block](),
+		curOutgoingRequests: container.NewSet[Request](),
 
 		desiredUpdated: make(chan struct{}, 1),
 		desiredState: peerState{
@@ -159,7 +159,7 @@ func (peer *Peer) blockReader() error {
 				// XXX make sure req.Length isn't too long
 				// OPT reuse buffers
 				buf := make([]byte, req.Length)
-				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Index)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
+				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Piece)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
 				if err != nil {
 					return err
 				}
@@ -168,7 +168,7 @@ func (peer *Peer) blockReader() error {
 
 				return peer.write(protocol.Message{
 					Type:   protocol.MessageTypePiece,
-					Index:  req.Index,
+					Index:  req.Piece,
 					Begin:  req.Begin,
 					Length: req.Length,
 					Data:   buf,
@@ -242,14 +242,14 @@ func (peer *Peer) BecomeUninterested() {
 func (peer *Peer) RejectRequest(index, begin, length uint32) {
 	peer.desiredMu.Lock()
 	defer peer.desiredMu.Unlock()
-	peer.desiredState.reject = append(peer.desiredState.reject, block{index, begin, length})
+	peer.desiredState.reject = append(peer.desiredState.reject, Request{index, begin, length})
 	channel.TrySend(peer.desiredUpdated, struct{}{})
 }
 
-func (peer *Peer) Request(index, begin, length uint32) {
+func (peer *Peer) Request(req Request) {
 	peer.desiredMu.Lock()
 	defer peer.desiredMu.Unlock()
-	peer.desiredState.request = append(peer.desiredState.request, block{index, begin, length})
+	peer.desiredState.request = append(peer.desiredState.request, req)
 	channel.TrySend(peer.desiredUpdated, struct{}{})
 }
 
@@ -384,17 +384,17 @@ func (peer *Peer) writePeer() error {
 			for _, req := range desired.request {
 				msgs = append(msgs, protocol.Message{
 					Type:   protocol.MessageTypeRequest,
-					Index:  req.piece,
-					Begin:  req.offset,
-					Length: req.length,
+					Index:  req.Piece,
+					Begin:  req.Begin,
+					Length: req.Length,
 				})
 			}
 			for _, rej := range desired.reject {
 				msgs = append(msgs, protocol.Message{
 					Type:   protocol.MessageTypeRejectRequest,
-					Index:  rej.piece,
-					Begin:  rej.offset,
-					Length: rej.length,
+					Index:  rej.Piece,
+					Begin:  rej.Begin,
+					Length: rej.Length,
 				})
 			}
 

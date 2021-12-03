@@ -33,6 +33,8 @@
 // If the user wishes to run actions in parallel with their other code, they have to set up concurrency themselves, by using goroutines.
 package bittorrent
 
+// XXX look at all integer types and decide on their width
+
 // XXX support removing torrents
 
 // XXX handle clients that don't support the Fast extension; don't send them messages they won't understand
@@ -65,6 +67,7 @@ import (
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
+	"honnef.co/go/bittorrent/mymath"
 	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
@@ -85,12 +88,6 @@ const maxPeersPerTorrent = 65535
 
 // How often each peer updates the global and per-torrent traffic statistics.
 const peerStatisticsInterval = 500 * time.Millisecond
-
-type request struct {
-	Index  uint32
-	Begin  uint32
-	Length uint32
-}
 
 func verifyBlock(data []byte, checksum []byte) bool {
 	h := sha1.Sum(data)
@@ -241,7 +238,95 @@ type Pieces struct {
 	have Bitset
 
 	// The size of a single piece, in blocks
-	pieceSize int
+	blocksPerNormalPiece int
+	// The index of the final piece
+	lastPieceIndex int
+	// The index of the final block
+	lastBlockIndex int
+	// The size of the final piece, in blocks
+	blocksPerLastPiece int
+	// The size of the final block, in bytes
+	bytesPerLastBlock int
+
+	bytesPerLastPiece   int
+	bytesPerNormalPiece int
+}
+
+func NewPieces(torr *Torrent) Pieces {
+	pieceSize := torr.Metainfo.Info.PieceLength
+	lastPieceBytes := torr.NumBytes() - ((int64(torr.NumPieces()) - 1) * pieceSize)
+	lastPieceBlocks := mymath.DivUp(lastPieceBytes, protocol.MaxBlockSize)
+	lastBlockBytes := lastPieceBytes - (lastPieceBlocks-1)*protocol.MaxBlockSize
+
+	n := uint32(torr.NumPieces())
+	out := Pieces{
+		pieceIndices:         make([]uint32, n),
+		sortedPieces:         make([]uint32, n),
+		availabilities:       make([]uint16, n),
+		buckets:              []uint32{n},
+		requestedBlocks:      map[uint32]*Bitset{},
+		downloadedBlocks:     map[uint32]*Bitset{},
+		blocksPerNormalPiece: mymath.DivUp(int(pieceSize), protocol.MaxBlockSize),
+
+		lastPieceIndex:      torr.NumPieces() - 1,
+		lastBlockIndex:      int(lastPieceBlocks - 1),
+		blocksPerLastPiece:  int(lastPieceBlocks),
+		bytesPerLastBlock:   int(lastBlockBytes),
+		bytesPerLastPiece:   int(lastPieceBytes),
+		bytesPerNormalPiece: int(pieceSize),
+	}
+	for i := uint32(0); i < n; i++ {
+		out.pieceIndices[i] = i
+		out.sortedPieces[i] = i
+	}
+	return out
+}
+
+type Block struct {
+	Piece uint32
+	Block uint32
+}
+
+func (t *Pieces) RequestToBlock(req Request) Block {
+	if req.Begin%protocol.MaxBlockSize != 0 {
+		panic(fmt.Sprintf("request %v isn't block-aligned", req))
+	}
+	return Block{
+		Piece: req.Piece,
+		Block: req.Begin / protocol.MaxBlockSize,
+	}
+}
+
+func (t *Pieces) BlockToRequest(b Block) Request {
+	return Request{
+		Piece:  b.Piece,
+		Begin:  b.Block * protocol.MaxBlockSize,
+		Length: uint32(t.BytesInBlock(b)),
+	}
+}
+
+func (t *Pieces) BytesInBlock(b Block) int {
+	if b.Piece == uint32(t.lastPieceIndex) && b.Block == uint32(t.lastBlockIndex) {
+		return t.bytesPerLastBlock
+	} else {
+		return protocol.MaxBlockSize
+	}
+}
+
+func (t *Pieces) BytesInPiece(piece uint32) int {
+	if piece == uint32(t.lastPieceIndex) {
+		return t.bytesPerLastPiece
+	} else {
+		return t.bytesPerNormalPiece
+	}
+}
+
+func (t *Pieces) BlocksInPiece(piece uint32) int {
+	if piece == uint32(t.lastPieceIndex) {
+		return t.blocksPerLastPiece
+	} else {
+		return t.blocksPerNormalPiece
+	}
 }
 
 // Half-open interval [start, end) of blocks to request for piece.
@@ -267,15 +352,15 @@ func (t *Pieces) NeedPiece(piece uint32) {
 	delete(t.downloadedBlocks, piece)
 }
 
-func (t *Pieces) NeedBlock(piece uint32, block uint32) {
-	req, ok := t.requestedBlocks[piece]
+func (t *Pieces) NeedBlock(b Block) {
+	req, ok := t.requestedBlocks[b.Piece]
 	if !ok {
-		panic(fmt.Sprintf("called NeedBlock(%d, %d), but piece %d doesn't have any currently requested blocks", piece, block, piece))
+		panic(fmt.Sprintf("called NeedBlock(%v), but piece %d doesn't have any currently requested blocks", b, b.Piece))
 	}
-	if req.bits.Bit(int(block)) == 0 {
-		panic(fmt.Sprintf("called NeedBlock(%d, %d), but block %d wasn't requested", piece, block, block))
+	if req.bits.Bit(int(b.Block)) == 0 {
+		panic(fmt.Sprintf("called NeedBlock(%v), but block %d wasn't requested", b, b.Block))
 	}
-	req.Unset(block)
+	req.Unset(b.Block)
 }
 
 func (t *Pieces) HaveBlock(piece uint32, block uint32) (complete bool) {
@@ -285,7 +370,7 @@ func (t *Pieces) HaveBlock(piece uint32, block uint32) (complete bool) {
 		t.downloadedBlocks[piece] = req
 	}
 	req.Set(block)
-	return req.count == t.pieceSize
+	return req.count == t.BlocksInPiece(piece)
 }
 
 // TODO(dh): this API cannot support end-game mode
@@ -319,8 +404,8 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 	// check 64 pieces at a time.
 
 	blocksForPiece := func(piece uint32, max int) (ranges []blockRange, n int) {
-		if max > t.pieceSize {
-			max = t.pieceSize
+		if max > t.BlocksInPiece(piece) {
+			max = t.BlocksInPiece(piece)
 		}
 		reqBlocks, ok := t.requestedBlocks[piece]
 		if !ok {
@@ -330,12 +415,12 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 		if reqBlocks.count == 0 {
 			// We haven't requested any blocks of this piece, so we can request from 0 to max
 			ranges = append(ranges, blockRange{piece: piece, start: 0, end: max})
-		} else if reqBlocks.count == t.pieceSize {
+		} else if reqBlocks.count == t.BlocksInPiece(piece) {
 			// We have already requested all blocks in this piece
 		} else {
 			// Find contiguous ranges of blocks to request
 			start := -1
-			for bit := 0; bit < t.pieceSize; bit++ {
+			for bit := 0; bit < t.BlocksInPiece(piece); bit++ {
 				if max < 0 {
 					panic("max became negative")
 				}
@@ -366,8 +451,8 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 
 			if start != -1 {
 				// We ran out of blocks, end range
-				ranges = append(ranges, blockRange{piece: piece, start: start, end: t.pieceSize})
-				max -= t.pieceSize - start
+				ranges = append(ranges, blockRange{piece: piece, start: start, end: t.BlocksInPiece(piece)})
+				max -= t.BlocksInPiece(piece) - start
 			}
 		}
 

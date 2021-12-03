@@ -15,6 +15,7 @@ import (
 
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/container"
+	"honnef.co/go/bittorrent/mymath"
 	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 
@@ -144,21 +145,18 @@ func (sess *Session) Events() []Event {
 }
 
 func (sess *Session) validateMetainfo(info *Metainfo) error {
-	var a int64
+	var n int64
 	if len(info.Info.Files) == 0 {
 		// single-file mode
-		a = info.Info.Length
+		n = info.Info.Length
 	} else {
 		// multi-file mode
 		for _, f := range info.Info.Files {
-			a += f.Length
+			n += f.Length
 		}
 	}
 
-	b := info.Info.PieceLength
-
-	// XXX theoretically, this can overflow. practically it never will
-	numPieces := int((a + b - 1) / b)
+	numPieces := mymath.DivUp(n, info.Info.PieceLength)
 
 	u, err := url.Parse(info.Announce)
 	if err != nil {
@@ -170,7 +168,7 @@ func (sess *Session) validateMetainfo(info *Metainfo) error {
 	if info.Info.PieceLength < 1<<14 {
 		return fmt.Errorf("piece size %d is too small, has to be at least 16 KiB", info.Info.PieceLength)
 	}
-	if len(info.Info.Pieces) != 20*numPieces {
+	if int64(len(info.Info.Pieces)) != 20*numPieces {
 		return fmt.Errorf("got %d bytes of hashes, expected %d", len(info.Info.Pieces), 20*numPieces)
 	}
 	if info.Info.Name == "" {
