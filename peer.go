@@ -2,6 +2,7 @@ package bittorrent
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"honnef.co/go/bittorrent/channel"
@@ -85,6 +86,9 @@ type Peer struct {
 		downloaded  oursync.Uint64
 		last        time.Time
 		lastWasZero bool
+
+		downloadHistory    [4]uint64
+		downloadHistoryPtr int
 	}
 
 	// Statistics used by the choking algorithm.
@@ -128,6 +132,9 @@ func NewPeer(conn *protocol.Connection, sess *Session) *Peer {
 		},
 		peerInterested: false,
 		peerChoking:    true,
+
+		// Default value for peers that don't support an extended handshake
+		maxOutgoingRequests: 250,
 	}
 }
 
@@ -529,6 +536,9 @@ func (peer *Peer) updateStats() {
 	peer.Torrent.trackerSession.up.Add(up)
 	peer.Torrent.trackerSession.down.Add(down)
 
+	atomic.StoreUint64(&peer.statistics.downloadHistory[peer.statistics.downloadHistoryPtr], down)
+	peer.statistics.downloadHistoryPtr = peer.statistics.downloadHistoryPtr % len(peer.statistics.downloadHistory)
+
 	if up == 0 && down == 0 {
 		if peer.statistics.lastWasZero {
 			// Only skip emitting an event if the previous event was for zero bytes.
@@ -549,4 +559,14 @@ func (peer *Peer) updateStats() {
 	}
 
 	peer.session.addEvent(ev)
+}
+
+// DownloadSpeed returns the average speed at which we're downloading from the peer, in bytes per second.
+func (peer *Peer) DownloadSpeed() uint64 {
+	var avg float64
+	for i := range peer.statistics.downloadHistory {
+		v := float64(atomic.LoadUint64(&peer.statistics.downloadHistory[i]))
+		avg += (v - avg) / (float64(i) + 1)
+	}
+	return uint64(avg)
 }

@@ -436,7 +436,9 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			peer.extensions.utHolepunch = hs.Map["ut_holepunch"]
 			peer.extensions.utMetadata = hs.Map["ut_metadata"]
 			peer.ClientName = hs.ClientName
-			peer.maxOutgoingRequests = hs.NumRequests
+			if hs.NumRequests > 0 {
+				peer.maxOutgoingRequests = hs.NumRequests
+			}
 		} else {
 			switch msg.Type {
 			case protocol.MessageTypeBitfield:
@@ -590,8 +592,10 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 		case protocol.MessageTypeRejectRequest:
 			// XXX validate that we've actually requested this block
 			// XXX handle final block in final piece
+			// XXX kill peer that continuously rejects all our requests
 			peer.curOutgoingRequests.Delete(block{msg.Index, msg.Begin, protocol.BlockSize})
 			torr.pieces.NeedBlock(msg.Index, msg.Begin/protocol.BlockSize)
+			torr.requestBlocks(peer)
 		case protocol.MessageTypeSuggestPiece:
 			// TODO(dh): Can we do something useful with this?
 		default:
@@ -609,20 +613,21 @@ func (torr *Torrent) requestBlocks(peer *Peer) {
 		return
 	}
 
-	// XXX respect peer.maxOutgoingRequests
-
-	// XXX don't hard-code 10, use bandwidth-latency product
-	if len(peer.curOutgoingRequests) > 10 {
-		return
+	// Assuming an end-to-end latency of 1s, send enough requests to saturate twice the current download rate.
+	target := int(((peer.DownloadSpeed() * 2) / protocol.BlockSize) + 1)
+	if target < 0 || target > peer.maxOutgoingRequests {
+		target = peer.maxOutgoingRequests
 	}
 
-	// XXX don't hard-code 100, base off bandwidth-latency product
+	if len(peer.curOutgoingRequests) >= target {
+		return
+	}
 
 	// XXX if ok == false, the peer has nothing to offer
 	// us, and we should stop being interested. however,
 	// we have to become interested again if requests to
 	// another peer failed for a piece that this peer has.
-	ranges, _ := torr.pieces.Pick(peer, 100-len(peer.curOutgoingRequests))
+	ranges, _ := torr.pieces.Pick(peer, target-len(peer.curOutgoingRequests))
 	for _, r := range ranges {
 		for i := r.start; i < r.end; i++ {
 			// XXX when requesting the last block of the last piece, the block may be shorter than protocol.BlockSize
