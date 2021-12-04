@@ -558,7 +558,7 @@ func (peer *Peer) updateStats() {
 		Down:  down,
 	}
 
-	peer.session.addEvent(ev)
+	peer.session.emitEvent(ev)
 }
 
 // DownloadSpeed returns the average speed at which we're downloading from the peer, in bytes per second.

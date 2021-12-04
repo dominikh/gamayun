@@ -393,12 +393,12 @@ func (torr *Torrent) unchokePeers() {
 
 	for peer := range choke {
 		peer.Choke()
-		torr.session.addEvent(EventPeerChoked{peer, torr})
+		torr.session.emitEvent(EventPeerChoked{peer, torr})
 	}
 	for _, u := range unchokes {
 		if u.peer.AmChoking() {
 			u.peer.Unchoke()
-			torr.session.addEvent(EventPeerUnchoked{u.peer, torr, u.reason})
+			torr.session.emitEvent(EventPeerUnchoked{u.peer, torr, u.reason})
 		}
 	}
 
@@ -489,7 +489,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			peer.peerInterested = true
 			if torr.numUnchoked < uploadSlotsPerTorrent {
 				// We have free slots, unchoke the peer immediately.
-				torr.session.addEvent(EventPeerUnchoked{peer, torr, "immediately"})
+				torr.session.emitEvent(EventPeerUnchoked{peer, torr, "immediately"})
 				peer.Unchoke()
 				torr.numUnchoked++
 			}
@@ -641,7 +641,7 @@ func (torr *Torrent) trackPeer(peer *Peer) (peerID [20]byte, err error) {
 }
 
 func (torr *Torrent) startPeer(peer *Peer) error {
-	torr.session.addEvent(EventPeerConnected{
+	torr.session.emitEvent(EventPeerConnected{
 		Torrent: torr,
 		Peer:    peer,
 	})

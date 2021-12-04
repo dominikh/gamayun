@@ -277,7 +277,7 @@ func (sess *Session) listen() error {
 				defer sess.mu.Unlock()
 				sess.peers.Delete(peer)
 				sess.statistics.numConnectedPeers.Add(^uint64(0))
-				sess.addEvent(EventPeerDisconnected{
+				sess.emitEvent(EventPeerDisconnected{
 					When: time.Now(),
 					Peer: peer,
 					Err:  err,
@@ -390,7 +390,7 @@ func (sess *Session) isClosing() bool {
 	return ok
 }
 
-func (sess *Session) addEvent(ev Event) {
+func (sess *Session) emitEvent(ev Event) {
 	sess.eventsMu.Lock()
 	sess.events = append(sess.events, ev)
 	sess.eventsMu.Unlock()
@@ -411,7 +411,7 @@ func (sess *Session) announce(ctx context.Context, ann *Announce) (_ *TrackerRes
 			// to cancel all following announces that expect this
 			// announce to have gone through
 			ann.NextTry = time.Now().Add(10 * time.Second)
-			sess.addEvent(EventAnnounceFailed{*ann})
+			sess.emitEvent(EventAnnounceFailed{*ann})
 		}
 	}()
 
