@@ -641,6 +641,11 @@ func (torr *Torrent) trackPeer(peer *Peer) (peerID [20]byte, err error) {
 }
 
 func (torr *Torrent) startPeer(peer *Peer) error {
+	torr.session.addEvent(EventPeerConnected{
+		Torrent: torr,
+		Peer:    peer,
+	})
+
 	// We've received their handshake and peer ID and have
 	// sent ours, now tell the peer which pieces we have
 	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index

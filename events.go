@@ -13,6 +13,7 @@ func (EventPeerDisconnected) isEvent() {}
 func (EventAnnounceFailed) isEvent()   {}
 func (EventPeerUnchoked) isEvent()     {}
 func (EventPeerChoked) isEvent()       {}
+func (EventPeerConnected) isEvent()    {}
 
 type EventPeerTraffic struct {
 	// XXX report both raw traffic and data traffic
@@ -21,6 +22,12 @@ type EventPeerTraffic struct {
 	Peer  *Peer
 	Up    uint64
 	Down  uint64
+}
+
+// EventPeerConnected is emitted when a peer has connected and finished its half of the handshake.
+type EventPeerConnected struct {
+	Peer    *Peer
+	Torrent *Torrent
 }
 
 type EventPeerDisconnected struct {

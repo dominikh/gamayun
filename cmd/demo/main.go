@@ -14,7 +14,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"honnef.co/go/bittorrent"
-	"honnef.co/go/bittorrent/protocol"
 )
 
 func main() {
@@ -31,10 +30,10 @@ func main() {
 	client.PeerIDPrefix = []byte("GMY0001-")
 	client.ClientName = "Gamayun 0.0.1"
 
-	client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
-		log.Println("New peer:", pconn)
-		return true
-	}
+	// client.Callbacks.PeerIncoming = func(pconn *protocol.Connection) bool {
+	// 	log.Println("New peer:", pconn)
+	// 	return true
+	// }
 	// client.Callbacks.PeerHandshakeInfoHash = func(peer *bittorrent.Peer, h protocol.InfoHash) bool {
 	// 	log.Printf("Peer %s wants to connect to torrent %s", peer, h)
 	// 	return true
@@ -114,6 +113,8 @@ func main() {
 				log.Printf("%s: unchoking %s because %q", ev.Torrent, ev.Peer, ev.Reason)
 			case bittorrent.EventPeerChoked:
 				log.Printf("%s: choking %s", ev.Torrent, ev.Peer)
+			case bittorrent.EventPeerConnected:
+				log.Printf("%s: new peer %s", ev.Torrent, ev.Peer)
 			case bittorrent.EventPeerDisconnected:
 				log.Printf("peer %s disconnected: %s", ev.Peer, ev.Err)
 			default:
