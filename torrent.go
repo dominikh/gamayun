@@ -72,7 +72,7 @@ const (
 
 type Torrent struct {
 	Metainfo *Metainfo
-	Hash     protocol.InfoHash
+	InfoHash protocol.InfoHash
 
 	pieces    Pieces
 	data      *dataStorage
@@ -97,7 +97,7 @@ type Torrent struct {
 func NewTorrent(hash protocol.InfoHash, info *Metainfo, sess *Session) *Torrent {
 	torr := &Torrent{
 		Metainfo: info,
-		Hash:     hash,
+		InfoHash: hash,
 		session:  sess,
 		peers:    container.NewConcurrentSet[*Peer](),
 		peerIDRng: lockedRand{
@@ -156,7 +156,7 @@ func (torr *Torrent) Start() {
 	torr.trackerSession.down.Store(0)
 	torr.trackerSession.PeerID = torr.GeneratePeerID()
 	torr.addAnnounce(Announce{
-		InfoHash: torr.Hash,
+		InfoHash: torr.InfoHash,
 		Tracker:  torr.Metainfo.Announce,
 		PeerID:   torr.trackerSession.PeerID,
 		Event:    "started",
@@ -203,7 +203,7 @@ func (torr *Torrent) Stop() {
 			}
 
 			torr.addAnnounce(Announce{
-				InfoHash: torr.Hash,
+				InfoHash: torr.InfoHash,
 				Tracker:  torr.Metainfo.Announce,
 				PeerID:   torr.trackerSession.PeerID,
 				Event:    "stopped",
@@ -215,7 +215,7 @@ func (torr *Torrent) Stop() {
 }
 
 func (torr *Torrent) String() string {
-	return torr.Hash.String()
+	return torr.InfoHash.String()
 }
 
 func (torr *Torrent) IsComplete() bool {
@@ -633,7 +633,7 @@ func (torr *Torrent) trackPeer(peer *Peer) (peerID [20]byte, err error) {
 	if torr.state == TorrentStateStopped {
 		// Don't let peers connect to stopped torrents
 		torr.session.statistics.numRejectedPeers.stoppedTorrent.Add(1)
-		return [20]byte{}, StoppedTorrentError{torr.Hash}
+		return [20]byte{}, StoppedTorrentError{torr.InfoHash}
 	}
 	peer.Torrent = torr
 	torr.peers.Add(peer)

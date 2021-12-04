@@ -205,7 +205,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 		return nil, ErrClosing
 	}
 	sess.statistics.numTorrents.stopped.Add(1)
-	sess.torrents[torr.Hash] = torr
+	sess.torrents[torr.InfoHash] = torr
 
 	go torr.run()
 
