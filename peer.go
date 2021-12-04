@@ -510,7 +510,7 @@ func (peer *Peer) Close() {
 }
 
 func (peer *Peer) String() string {
-	return peer.conn.String()
+	return peer.conn.Conn.RemoteAddr().String()
 }
 
 func (peer *Peer) Kill(err error) {
