@@ -35,9 +35,6 @@ func main() {
 		log.Println("New peer:", pconn)
 		return true
 	}
-	client.Callbacks.PeerDisconnected = func(peer *bittorrent.Peer, err error) {
-		log.Println("Peer disconnected:", peer, err)
-	}
 	// client.Callbacks.PeerHandshakeInfoHash = func(peer *bittorrent.Peer, h protocol.InfoHash) bool {
 	// 	log.Printf("Peer %s wants to connect to torrent %s", peer, h)
 	// 	return true
@@ -101,7 +98,6 @@ func main() {
 
 	t := time.NewTicker(5 * time.Second)
 
-	// XXX leak
 	traffic := map[*bittorrent.Torrent]struct{ up, down uint64 }{}
 	for range t.C {
 		for _, ev := range client.Events() {
@@ -118,8 +114,10 @@ func main() {
 				log.Printf("%s: unchoking %s because %q", ev.Torrent, ev.Peer, ev.Reason)
 			case bittorrent.EventPeerChoked:
 				log.Printf("%s: choking %s", ev.Torrent, ev.Peer)
+			case bittorrent.EventPeerDisconnected:
+				log.Printf("peer %s disconnected: %s", ev.Peer, ev.Err)
 			default:
-				log.Printf("unhandled event: %v", ev)
+				panic(fmt.Sprintf("unhandled event: %v", ev))
 			}
 		}
 

@@ -78,11 +78,6 @@ type Session struct {
 		//
 		// Rejected connections will trigger PeerDisconnected.
 		PeerHandshakePeerID func(peer *Peer, peerID [20]byte) (allow bool)
-
-		// XXX this should be an event instead, because we don't depend on a return value
-		//
-		// If set, PeerDisconnected gets called after a peer connection has been closed.
-		PeerDisconnected func(peer *Peer, err error)
 	}
 
 	done chan struct{}
@@ -282,9 +277,11 @@ func (sess *Session) listen() error {
 				defer sess.mu.Unlock()
 				sess.peers.Delete(peer)
 				sess.statistics.numConnectedPeers.Add(^uint64(0))
-				if sess.Callbacks.PeerDisconnected != nil {
-					sess.Callbacks.PeerDisconnected(peer, err)
-				}
+				sess.addEvent(EventPeerDisconnected{
+					When: time.Now(),
+					Peer: peer,
+					Err:  err,
+				})
 			}()
 
 			return nil

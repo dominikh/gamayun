@@ -1,5 +1,7 @@
 package bittorrent
 
+// XXX all events should contain a timestamp
+
 import "time"
 
 type Event interface {
@@ -24,6 +26,7 @@ type EventPeerTraffic struct {
 type EventPeerDisconnected struct {
 	When time.Time
 	Peer *Peer
+	Err  error
 }
 
 type EventAnnounceFailed struct {
