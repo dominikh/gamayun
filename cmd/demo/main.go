@@ -162,17 +162,17 @@ func (fsys *FS) Root() (fs.Node, error) {
 }
 
 type TextFile struct {
-	content func() string
+	content []byte
 }
 
 func (file *TextFile) Attr(ctx context.Context, a *fuse.Attr) error {
 	a.Mode = 0o444
-	a.Size = uint64(len(file.content()))
+	a.Size = uint64(len(file.content))
 	return nil
 }
 
 func (f *TextFile) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	fuseutil.HandleRead(req, resp, []byte(f.content()))
+	fuseutil.HandleRead(req, resp, []byte(f.content))
 	return nil
 }
 
@@ -248,6 +248,8 @@ func (torrs *Torrents) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	return out, nil
 }
 
+// XXX our use of TextFile is wrong. FUSE caches the fs.Node, so repeatedly reading the same file will yield stale data. We should separate the node from the handle.
+
 // XXX we create new fs.Nodes all the time, but we should try to reuse
 // them, so that files have stable NodeIDs.
 func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error) {
@@ -300,6 +302,7 @@ func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error)
 
 						// OPT(dh): add a map from string to peer
 						for peer := range torr.Peers {
+							peer := peer
 							if peer.peer.String() == name {
 								return &Dir{
 									readDirAll: func(ctx context.Context) ([]fuse.Dirent, error) {
@@ -308,9 +311,7 @@ func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error)
 									lookup: func(ctx context.Context, name string) (fs.Node, error) {
 										switch name {
 										case "stats":
-											return &TextFile{func() string {
-												return fmt.Sprintf("%d %d %t\n", peer.peer.Statistics.Uploaded.Load(), peer.peer.Statistics.Downloaded.Load(), peer.unchoked)
-											}}, nil
+											return &TextFile{[]byte(fmt.Sprintf("%d %d %t\n", peer.peer.Statistics.Uploaded.Load(), peer.peer.Statistics.Downloaded.Load(), peer.unchoked))}, nil
 										case "ctl":
 											// XXX
 											return nil, syscall.EIO
@@ -325,21 +326,11 @@ func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error)
 					},
 				}, nil
 			case "name":
-				return &TextFile{
-					content: func() string { return torr.Torrent.Metainfo.Info.Name + "\n" },
-				}, nil
+				return &TextFile{[]byte(torr.Torrent.Metainfo.Info.Name + "\n")}, nil
 			case "stats":
-				return &TextFile{
-					content: func() string {
-						return fmt.Sprintf("%d %d\n", torr.Torrent.Statistics.Uploaded.Load(), torr.Torrent.Statistics.Downloaded.Load())
-					},
-				}, nil
+				return &TextFile{[]byte(fmt.Sprintf("%d %d\n", torr.Torrent.Statistics.Uploaded.Load(), torr.Torrent.Statistics.Downloaded.Load()))}, nil
 			case "completion":
-				return &TextFile{
-					content: func() string {
-						return fmt.Sprintf("%d %d\n", torr.Torrent.CompletedPieces(), torr.Torrent.NumPieces())
-					},
-				}, nil
+				return &TextFile{[]byte(fmt.Sprintf("%d %d\n", torr.Torrent.CompletedPieces(), torr.Torrent.NumPieces()))}, nil
 			case "ctl":
 				return &TorrentCtl{
 					torr: torr,
