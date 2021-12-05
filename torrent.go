@@ -75,7 +75,7 @@ type Torrent struct {
 	InfoHash protocol.InfoHash
 
 	pieces    Pieces
-	data      *dataStorage
+	Data      *DataStorage
 	session   *Session
 	announces announceQueue[Announce]
 	peerIDRng lockedRand
@@ -219,7 +219,7 @@ func (torr *Torrent) String() string {
 }
 
 func (torr *Torrent) IsComplete() bool {
-	return torr.pieces.have.count == torr.NumPieces()
+	return torr.CompletedPieces() == torr.NumPieces()
 }
 
 func (torr *Torrent) SetHave(have Bitset) {
@@ -244,6 +244,12 @@ func (info *Metainfo) NumBytes() int64 {
 	return a
 }
 
+// CompletedPieces returns the number of pieces that have been downloaded, hashed and written to disk.
+func (torr *Torrent) CompletedPieces() int {
+	return torr.pieces.have.Count()
+}
+
+// NumPieces returns the total number of pieces in the torrent.
 func (torr *Torrent) NumPieces() int {
 	a := torr.NumBytes()
 	b := torr.Metainfo.Info.PieceLength
@@ -531,7 +537,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			})
 			torr.requestBlocks(peer)
 			off := int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength) + int64(msg.Begin)
-			if _, err := torr.data.WriteAt(msg.Data, off); err != nil {
+			if _, err := torr.Data.WriteAt(msg.Data, off); err != nil {
 				// XXX It's not enough to just return an error. That will
 				// just kill the peer, but it's not a problem with the
 				// peer, but with our storage, and we should stop the
@@ -541,7 +547,7 @@ func (torr *Torrent) handlePeerMessage(peer *Peer, msg protocol.Message) error {
 			if torr.pieces.HaveBlock(msg.Index, msg.Begin/protocol.MaxBlockSize) {
 				// OPT(dh): move hashing to separate goroutine; we don't need backpressure from hashing.
 				buf := make([]byte, torr.pieces.BytesInPiece(msg.Index))
-				_, err := torr.data.ReadAt(buf, int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength))
+				_, err := torr.Data.ReadAt(buf, int64(msg.Index)*int64(torr.Metainfo.Info.PieceLength))
 				if err != nil {
 					// XXX It's not enough to just return an error. That will
 					// just kill the peer, but it's not a problem with the
@@ -649,11 +655,11 @@ func (torr *Torrent) startPeer(peer *Peer) error {
 	// We've received their handshake and peer ID and have
 	// sent ours, now tell the peer which pieces we have
 	const haveMessageSize = 4 + 1 + 4 // length prefix, message type, index
-	if torr.pieces.have.count == 0 {
+	if torr.pieces.have.Count() == 0 {
 		peer.HaveNone()
-	} else if torr.pieces.have.count == torr.NumPieces() {
+	} else if torr.pieces.have.Count() == torr.NumPieces() {
 		peer.HaveAll()
-	} else if torr.pieces.have.count*haveMessageSize < torr.NumPieces()/8 || true {
+	} else if torr.pieces.have.Count()*haveMessageSize < torr.NumPieces()/8 || true {
 		// it's more compact to send a few Have messages than a bitfield that is mostly zeroes
 		for i := 0; i < torr.NumPieces(); i++ {
 			if torr.pieces.have.bits.Bit(i) != 0 {

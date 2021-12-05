@@ -185,7 +185,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 
 	torr := NewTorrent(hash, info, sess)
 
-	var files dataStorage
+	var files DataStorage
 	if len(info.Info.Files) == 0 {
 		// single-file mode
 		files.add(info.Info.Name, info.Info.Length)
@@ -196,7 +196,7 @@ func (sess *Session) AddTorrent(info *Metainfo, hash protocol.InfoHash) (*Torren
 			files.add(filepath.Join(info.Info.Name, filepath.Join(fe.Path...)), fe.Length)
 		}
 	}
-	torr.data = &files
+	torr.Data = &files
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()

@@ -119,7 +119,7 @@ type Announce struct {
 }
 
 type Bitset struct {
-	count int
+	count oursync.Uint32
 	// OPT: don't use big.Int. use our own representation that matches
 	// the wire protocol, so that we don't have to convert between the
 	// two all the time
@@ -142,7 +142,7 @@ func (set *Bitset) Set(bit uint32) {
 	if set.bits.Bit(int(bit)) == 1 {
 		return
 	}
-	set.count++
+	set.count.Add(1)
 	set.bits.SetBit(&set.bits, int(bit), 1)
 }
 
@@ -150,7 +150,7 @@ func (set *Bitset) Unset(bit uint32) {
 	if set.bits.Bit(int(bit)) == 0 {
 		return
 	}
-	set.count--
+	set.count.Add(^uint32(0))
 	set.bits.SetBit(&set.bits, int(bit), 0)
 }
 
@@ -164,7 +164,7 @@ func (set *Bitset) SetBitfield(buf []byte) {
 		for n := 7; n >= 0; n-- {
 			bit++
 			if b&1<<n != 0 {
-				set.count++
+				set.count.Add(1)
 				set.bits.SetBit(&set.bits, bit, 1)
 			} else {
 				set.bits.SetBit(&set.bits, bit, 0)
@@ -176,7 +176,7 @@ func (set *Bitset) SetBitfield(buf []byte) {
 func (set Bitset) Intersect(other Bitset) Bitset {
 	out := Bitset{}
 
-	if set.count == 0 || other.count == 0 {
+	if set.count.Load() == 0 || other.count.Load() == 0 {
 		return out
 	}
 
@@ -185,14 +185,16 @@ func (set Bitset) Intersect(other Bitset) Bitset {
 	// OPT: we'll call Intersect a lot, and Bytes allocates, so this is no good.
 	// We could use FillBytes, but the loop is still O(n).
 	for _, b := range out.bits.Bytes() {
-		out.count += bits.OnesCount8(b)
+		out.count.Add(uint32(bits.OnesCount8(b)))
 	}
 	return out
 }
 
 func (set *Bitset) String() string {
-	return fmt.Sprintf("%d bits set", set.count)
+	return fmt.Sprintf("%d bits set", set.Count())
 }
+
+func (set *Bitset) Count() int { return int(set.count.Load()) }
 
 // OPT track HaveAll separately
 
@@ -370,7 +372,7 @@ func (t *Pieces) HaveBlock(piece uint32, block uint32) (complete bool) {
 		t.downloadedBlocks[piece] = req
 	}
 	req.Set(block)
-	return req.count == t.BlocksInPiece(piece)
+	return int(req.count.Load()) == t.BlocksInPiece(piece)
 }
 
 // TODO(dh): this API cannot support end-game mode
@@ -388,7 +390,7 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 		panic(fmt.Sprintf("trying to pick piece for peer %s we're not interested in", peer))
 	}
 
-	if peer.have.count == 0 {
+	if peer.have.count.Load() == 0 {
 		panic(fmt.Sprintf("interested in peer %s with no pieces", peer))
 	}
 
@@ -412,10 +414,10 @@ func (t *Pieces) Pick(peer *Peer, numBlocks int) (ranges []blockRange, ok bool) 
 			reqBlocks = new(Bitset)
 			t.requestedBlocks[piece] = reqBlocks
 		}
-		if reqBlocks.count == 0 {
+		if reqBlocks.count.Load() == 0 {
 			// We haven't requested any blocks of this piece, so we can request from 0 to max
 			ranges = append(ranges, blockRange{piece: piece, start: 0, end: max})
-		} else if reqBlocks.count == t.BlocksInPiece(piece) {
+		} else if int(reqBlocks.count.Load()) == t.BlocksInPiece(piece) {
 			// We have already requested all blocks in this piece
 		} else {
 			// Find contiguous ranges of blocks to request
@@ -594,7 +596,7 @@ func (l *Verify) Run() (result interface{}, stopped bool, err error) {
 		default:
 		}
 
-		n, err := l.Torrent.data.ReadAt(buf, int64(piece)*int64(pieceSize))
+		n, err := l.Torrent.Data.ReadAt(buf, int64(piece)*int64(pieceSize))
 		if err != nil {
 			if err == io.ErrUnexpectedEOF {
 				if piece+1 != uint32(numPieces) {
@@ -635,34 +637,34 @@ func NewVerify(torr *Torrent) Action {
 // TODO(dh): add necessary interfaces so that we don't depend on the file system. something that can open paths and return io.ReaderAts.
 
 // OPT cache open files
-type dataStorage struct {
-	files  []dataStorageFile
-	length int64
+type DataStorage struct {
+	Files  []DataStorageFile
+	Length int64
 }
 
-type dataStorageFile struct {
+type DataStorageFile struct {
 	Path   string
 	Offset int64
 	Size   int64
 }
 
-func (ds *dataStorage) add(path string, length int64) {
-	ds.files = append(ds.files, dataStorageFile{path, ds.length, length})
-	ds.length += length
+func (ds *DataStorage) add(path string, length int64) {
+	ds.Files = append(ds.Files, DataStorageFile{path, ds.Length, length})
+	ds.Length += length
 }
 
-func (ds *dataStorage) relevantFiles(n int, off int64) []dataStorageFile {
+func (ds *DataStorage) relevantFiles(n int, off int64) []DataStorageFile {
 	// Skip past the requested offset.
-	skipFiles := sort.Search(len(ds.files), func(i int) bool {
+	skipFiles := sort.Search(len(ds.Files), func(i int) bool {
 		// This function returns whether Files[i] will
 		// contribute any bytes to our output.
-		file := ds.files[i]
+		file := ds.Files[i]
 		return file.Offset+file.Size > off
 	})
-	return ds.files[skipFiles:]
+	return ds.Files[skipFiles:]
 }
 
-func (ds *dataStorage) ReadAt(p []byte, off int64) (int, error) {
+func (ds *DataStorage) ReadAt(p []byte, off int64) (int, error) {
 	wantN := len(p)
 
 	files := ds.relevantFiles(len(p), off)
@@ -716,7 +718,7 @@ func (ds *dataStorage) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func (ds *dataStorage) WriteAt(p []byte, off int64) (int, error) {
+func (ds *DataStorage) WriteAt(p []byte, off int64) (int, error) {
 	files := ds.relevantFiles(len(p), off)
 	// How far to skip in the first file.
 	needSkip := off

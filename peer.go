@@ -159,7 +159,7 @@ func (peer *Peer) blockReader() error {
 				// XXX make sure req.Length isn't too long
 				// OPT reuse buffers
 				buf := make([]byte, req.Length)
-				_, err := peer.Torrent.data.ReadAt(buf, int64(req.Piece)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
+				_, err := peer.Torrent.Data.ReadAt(buf, int64(req.Piece)*int64(peer.Torrent.Metainfo.Info.PieceLength)+int64(req.Begin))
 				if err != nil {
 					return err
 				}
@@ -345,7 +345,7 @@ func (peer *Peer) writePeer() error {
 					Type: protocol.MessageTypeHaveAll,
 				})
 			}
-			if desired.bitfield.count > 0 {
+			if desired.bitfield.count.Load() > 0 {
 				// XXX
 				panic("not implemented")
 			}

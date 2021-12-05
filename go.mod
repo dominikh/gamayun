@@ -3,6 +3,7 @@ module honnef.co/go/bittorrent
 go 1.18
 
 require (
+	bazil.org/fuse v0.0.0-20200524192727-fb710f7dfd05
 	github.com/prometheus/client_golang v1.11.0
 	github.com/prometheus/client_model v0.2.0
 	github.com/zeebo/bencode v1.0.0
