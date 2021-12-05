@@ -75,17 +75,19 @@ type Peer struct {
 	// Accessed exclusively from Session.unchokePeers.
 	lastUnchoke time.Time
 
-	// Amount of data transfered since the last time we've reported statistics as an event.
-	statistics struct {
+	// Amount of data transfered since the last time we've reported Statistics as an event.
+	Statistics struct {
 		// XXX check alignment on 32-bit systems
 		// XXX differentiate raw traffic and data traffic
 
-		// How much data we have uploaded to the peer
-		uploaded oursync.Uint64
-		// How much data we have downloaded from the peer
-		downloaded  oursync.Uint64
-		last        time.Time
-		lastWasZero bool
+		// How much data we have Uploaded to the peer
+		Uploaded oursync.Uint64
+		// How much data we have Downloaded from the peer
+		Downloaded oursync.Uint64
+
+		uploadedLast   uint64
+		downloadedLast uint64
+		sentStartEvent bool
 
 		downloadHistory    [4]uint64
 		downloadHistoryPtr int
@@ -206,8 +208,9 @@ func (peer *Peer) readPeer(sendTo chan<- protocol.Message) error {
 		case msg := <-msgs:
 			size := uint64(msg.Size())
 			peer.session.statistics.downloadedRaw.Add(size)
-			peer.statistics.downloaded.Add(size)
+			peer.Statistics.Downloaded.Add(size)
 			peer.chokingStatistics.downloaded.Add(size)
+			peer.Torrent.Statistics.Downloaded.Add(size)
 			select {
 			case sendTo <- msg:
 			case <-peer.done:
@@ -306,14 +309,18 @@ func (peer *Peer) AmInterested() bool {
 
 func (peer *Peer) writePeer() error {
 	writeMsg := func(msg protocol.Message) error {
-		peer.session.statistics.uploadedRaw.Add(uint64(msg.Size()))
-		peer.statistics.uploaded.Add(uint64(msg.Size()))
+		size := uint64(msg.Size())
+		peer.session.statistics.uploadedRaw.Add(size)
+		peer.Statistics.Uploaded.Add(size)
+		peer.Torrent.Statistics.Uploaded.Add(size)
 		return peer.conn.WriteMessage(msg)
 	}
 	writeMsgs := func(msgs []protocol.Message) error {
 		for _, msg := range msgs {
-			peer.session.statistics.uploadedRaw.Add(uint64(msg.Size()))
-			peer.statistics.uploaded.Add(uint64(msg.Size()))
+			size := uint64(msg.Size())
+			peer.session.statistics.uploadedRaw.Add(size)
+			peer.Statistics.Uploaded.Add(size)
+			peer.Torrent.Statistics.Uploaded.Add(size)
 		}
 		return peer.conn.WriteMessages(msgs)
 	}
@@ -518,10 +525,14 @@ func (peer *Peer) Kill(err error) {
 }
 
 func (peer *Peer) updateStats() {
-	now := time.Now()
-	defer func() { peer.statistics.last = now }()
-	up := peer.statistics.uploaded.Swap(0)
-	down := peer.statistics.downloaded.Swap(0)
+	up := peer.Statistics.Uploaded.Load()
+	down := peer.Statistics.Downloaded.Load()
+
+	Δup := up - peer.Statistics.uploadedLast
+	Δdown := down - peer.Statistics.downloadedLast
+
+	peer.Statistics.uploadedLast = up
+	peer.Statistics.downloadedLast = down
 
 	// XXX the tracker cares about data traffic, not raw traffic
 	//
@@ -533,39 +544,27 @@ func (peer *Peer) updateStats() {
 	//
 	// We do, however, have to use atomic operations, because multiple
 	// peers may be updating the same torrent's stats.
-	peer.Torrent.trackerSession.up.Add(up)
-	peer.Torrent.trackerSession.down.Add(down)
+	peer.Torrent.trackerSession.up.Add(Δup)
+	peer.Torrent.trackerSession.down.Add(Δdown)
 
-	atomic.StoreUint64(&peer.statistics.downloadHistory[peer.statistics.downloadHistoryPtr], down)
-	peer.statistics.downloadHistoryPtr = peer.statistics.downloadHistoryPtr % len(peer.statistics.downloadHistory)
+	atomic.StoreUint64(&peer.Statistics.downloadHistory[peer.Statistics.downloadHistoryPtr], Δdown)
+	peer.Statistics.downloadHistoryPtr = peer.Statistics.downloadHistoryPtr % len(peer.Statistics.downloadHistory)
 
-	if up == 0 && down == 0 {
-		if peer.statistics.lastWasZero {
-			// Only skip emitting an event if the previous event was for zero bytes.
-			// We want to emit a zero bytes event at least once so that clients can update the displayed rate
-			return
-		}
-		peer.statistics.lastWasZero = true
-	} else {
-		peer.statistics.lastWasZero = false
+	if Δup == 0 && Δdown == 0 && peer.Statistics.sentStartEvent {
+		peer.session.emitEvent(EventPeerNoTraffic{Peer: peer})
+		peer.Statistics.sentStartEvent = false
+	} else if (Δup != 0 || Δdown != 0) && !peer.Statistics.sentStartEvent {
+		// XXX we want to send this event as soon as traffic happened, not at our sampling interval
+		peer.session.emitEvent(EventPeerTraffic{Peer: peer})
+		peer.Statistics.sentStartEvent = true
 	}
-
-	ev := EventPeerTraffic{
-		Start: peer.statistics.last,
-		Stop:  now,
-		Peer:  peer,
-		Up:    up,
-		Down:  down,
-	}
-
-	peer.session.emitEvent(ev)
 }
 
 // DownloadSpeed returns the average speed at which we're downloading from the peer, in bytes per second.
 func (peer *Peer) DownloadSpeed() uint64 {
 	var avg float64
-	for i := range peer.statistics.downloadHistory {
-		v := float64(atomic.LoadUint64(&peer.statistics.downloadHistory[i]))
+	for i := range peer.Statistics.downloadHistory {
+		v := float64(atomic.LoadUint64(&peer.Statistics.downloadHistory[i]))
 		avg += (v - avg) / (float64(i) + 1)
 	}
 	return uint64(avg)

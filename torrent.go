@@ -12,6 +12,7 @@ import (
 	"honnef.co/go/bittorrent/channel"
 	"honnef.co/go/bittorrent/container"
 	"honnef.co/go/bittorrent/mymath"
+	"honnef.co/go/bittorrent/oursync"
 	"honnef.co/go/bittorrent/protocol"
 )
 
@@ -73,6 +74,11 @@ const (
 type Torrent struct {
 	Metainfo *Metainfo
 	InfoHash protocol.InfoHash
+
+	Statistics struct {
+		Uploaded   oursync.Uint64
+		Downloaded oursync.Uint64
+	}
 
 	pieces    Pieces
 	Data      *DataStorage

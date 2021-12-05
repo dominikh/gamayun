@@ -9,19 +9,22 @@ type Event interface {
 }
 
 func (EventPeerTraffic) isEvent()      {}
+func (EventPeerNoTraffic) isEvent()    {}
 func (EventPeerDisconnected) isEvent() {}
 func (EventAnnounceFailed) isEvent()   {}
 func (EventPeerUnchoked) isEvent()     {}
 func (EventPeerChoked) isEvent()       {}
 func (EventPeerConnected) isEvent()    {}
 
+// EventPeerTraffic is emitted once a peer has traffic.
+// It will not be sent again for the same peer until an EventPeerNoTraffic has been emitted.
 type EventPeerTraffic struct {
-	// XXX report both raw traffic and data traffic
-	Start time.Time
-	Stop  time.Time
-	Peer  *Peer
-	Up    uint64
-	Down  uint64
+	Peer *Peer
+}
+
+// EventPeerNoTraffic is emitted once a peer no longer has any traffic.
+type EventPeerNoTraffic struct {
+	Peer *Peer
 }
 
 // EventPeerConnected is emitted when a peer has connected and finished its half of the handshake.

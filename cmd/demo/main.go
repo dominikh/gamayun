@@ -33,8 +33,6 @@ type Torrent struct {
 
 type Peer struct {
 	peer     *bittorrent.Peer
-	up       uint64
-	down     uint64
 	unchoked bool
 }
 
@@ -80,9 +78,7 @@ func (cl *Client) Run() error {
 			for _, ev := range cl.sess.Events() {
 				switch ev := ev.(type) {
 				case bittorrent.EventPeerTraffic:
-					peer := cl.peers[ev.Peer]
-					peer.up += ev.Up
-					peer.down += ev.Down
+				case bittorrent.EventPeerNoTraffic:
 				case bittorrent.EventAnnounceFailed:
 					// nothing to do
 				case bittorrent.EventPeerUnchoked:
@@ -197,6 +193,7 @@ var torrentDirents = []fuse.Dirent{
 	{Type: fuse.DT_File, Name: "name"},
 	{Type: fuse.DT_File, Name: "ctl"},
 	{Type: fuse.DT_File, Name: "completion"},
+	{Type: fuse.DT_File, Name: "stats"},
 }
 var peerDirents = []fuse.Dirent{
 	{Type: fuse.DT_File, Name: "stats"},
@@ -312,9 +309,7 @@ func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error)
 										switch name {
 										case "stats":
 											return &TextFile{func() string {
-												torrs.client.lock()
-												defer torrs.client.unlock()
-												return fmt.Sprintf("%d %d %t\n", peer.up, peer.down, peer.unchoked)
+												return fmt.Sprintf("%d %d %t\n", peer.peer.Statistics.Uploaded.Load(), peer.peer.Statistics.Downloaded.Load(), peer.unchoked)
 											}}, nil
 										case "ctl":
 											// XXX
@@ -332,6 +327,12 @@ func (torrs *Torrents) Lookup(ctx context.Context, name string) (fs.Node, error)
 			case "name":
 				return &TextFile{
 					content: func() string { return torr.Torrent.Metainfo.Info.Name + "\n" },
+				}, nil
+			case "stats":
+				return &TextFile{
+					content: func() string {
+						return fmt.Sprintf("%d %d\n", torr.Torrent.Statistics.Uploaded.Load(), torr.Torrent.Statistics.Downloaded.Load())
+					},
 				}, nil
 			case "completion":
 				return &TextFile{
